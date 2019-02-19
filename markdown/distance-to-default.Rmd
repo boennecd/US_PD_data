@@ -1,0 +1,404 @@
+---
+title: "Distance-to-Default"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+bibliography: refs.bib
+---
+
+<script>
+$(document).ready(function(){
+  var hide_divs = $("div.hideable");
+  hide_divs.each(function(){
+    // Wrap content in div
+    $(this).wrapInner( "<div class='hideable_content', style='display: none;'></div>");
+    
+    // Add button
+    $(this).prepend("<button id='toogle'>show</button>");
+  });
+  
+  // Add hideable btn
+  // Put the rest in a div
+  
+  $("div.hideable button#toogle").click(function(){
+    var parent = $(this).parent();
+    var target_div = $(parent).find("div.hideable_content");
+    
+    if(target_div.css("display") == "none"){
+      target_div.show();
+        $(this).text("Hide");
+    } else {
+      target_div.hide();
+      $(this).text("Show");
+    }
+  });
+});
+</script>
+
+## Load data
+
+```{r static_setup, include=FALSE, cache=FALSE}
+# please do not set options here that could change...
+knitr::opts_chunk$set(
+  cache.path = 
+    paste0(file.path("cache", "distance-to-default"), .Platform$file.sep), 
+  fig.path = 
+    paste0(file.path("fig"  , "distance-to-default"), .Platform$file.sep))
+```
+
+```{r def_data_files}
+# assign file names
+fs <- list(
+  daily    = file.path("data", "CRSP", "daily_stacked.RDS"), 
+  monthly  = file.path("data", "CRSP", "monthly_stacked.RDS"),
+  t_bill   = file.path("data", "tress_bill.RDS"), 
+  ym_R     = file.path("R", "ym.R"), 
+  map_file = file.path("data", "moody-compu-link.RDS"))
+```
+
+```{r check_rebuild, echo = FALSE, cache = TRUE, cache.extra = tools::md5sum(unlist(fs))}
+# see https://stackoverflow.com/a/52163751/5861244
+knitr::opts_chunk$set(cache.rebuild = TRUE) 
+```
+
+```{r setup, include=FALSE, cache=FALSE}
+# please do set options here that could change...
+knitr::opts_chunk$set(
+  echo = TRUE, fig.height = 4, fig.width = 7, dpi = 128, comment = "#R", 
+  error = FALSE)
+options(digits = 4, scipen = 10, width = 70)
+```
+
+```{r load_dat}
+daily <- readRDS(fs$daily)
+monthly <- readRDS(fs$monthly)
+```
+
+Checks
+
+```{r start_checks}
+stopifnot(
+  all(tapply(daily$date, daily$permno, anyDuplicated) == 0),
+  all(tapply(monthly$date, monthly$permno, anyDuplicated) == 0), 
+  all(daily$permno %in% monthly$permno))
+```
+
+Keep only the permno we need 
+
+```{r keep_needed}
+# Get the list of permnos and permco to keep
+map_obj <- readRDS(fs$map_file)
+gvkey_keep <- unique(map_obj$gvkey)
+permno_keep <- with(monthly, unique(permno[gvkey %in% gvkey_keep]))
+
+# subset 
+monthly <- subset(monthly, permno %in% permno_keep)
+daily   <- subset(daily  , permno %in% permno_keep)
+```
+
+Make year month variables
+
+```{r source_ym}
+source(fs$ym_R)
+daily$ym   <- make_ym(daily$date)
+monthly$ym <- make_ym(monthly$date)
+```
+
+Keep only the columns we need
+
+```{r subset_cols}
+monthly <- monthly[, c("permno", "ym", "gvkey", "dlcq", "dlttq")]
+daily   <- daily  [, c("permno", "ym", "mv", "date")]
+```
+
+We have some NA values in the COMPUSTAT data. We replace these with zero (maybe 
+[check this forum post](http://www.wrds.us/index.php/forum_wrds/viewthread/624)). 
+
+```{r deal_w_nas}
+monthly <- within(monthly, {
+  dlcq  <- ifelse(is.na(dlcq ), 0., dlcq )
+  dlttq <- ifelse(is.na(dlttq), 0., dlttq)
+  # take 50% of long term debt as in e.g., Vassalou, and Xing (2004)
+  debt <- dlcq + dlttq * .5
+})
+
+monthly <- monthly[, !colnames(monthly) %in% c("dlcq", "dlttq")]
+
+# cannot compute distance-to-default with zero debt
+nrow(monthly)
+monthly <- subset(monthly, debt > 0)
+nrow(monthly)
+```
+
+We drop the `NA` market values
+
+```{r remove_na_mv}
+nrow(daily)
+daily <- subset(daily, !is.na(mv))
+nrow(daily)
+```
+
+Merge the data sets
+
+```{r merge}
+mer <- merge(daily, monthly, by = c("ym", "permno"))
+nrow(mer)
+
+# clean up 
+rm(daily, monthly)
+```
+
+Only keep observations that have more than two rows of data
+
+```{r drop_too_few, message = FALSE}
+library(data.table)
+nrow(mer)
+mer <- data.table(mer)
+setkey(mer, permno, date)
+
+invisible(mer[, nobs := .N, by = permno])
+mer <- mer[nobs > 2L, ]
+invisible(mer[, nobs := NULL])
+
+nrow(mer)
+```
+
+Add the risk free rates
+
+```{r load_rates, message = FALSE}
+tress <- readRDS(fs$t_bill)
+
+# some of the values are NA. Here we find the longest sequence of NAs
+stopifnot(!is.unsorted(tress$date))
+with(tress, {
+  cur_gap <- 0
+  max_gap <- 0
+  for(i in 2:length(r1y)){
+    if(is.na(r1y[i])){
+      cur_gap <- date[i] - tress$date[i - 1L] + cur_gap
+      if(cur_gap > max_gap)
+        max_gap <- cur_gap
+    } else 
+      cur_gap <- 0
+  }
+  
+  max_gap
+})
+
+# next we show that the rate is close to constant over short periods
+plot(tress$r1y ~ tress$date, type = "l")
+
+# this justifies to use Last Observation Carried Forward
+library(zoo)
+tress$r1y <- na.locf(tress$r1y)
+
+# turn into log return rates
+tress$r1y <- log1p(tress$r1y)
+lines(tress$date, tress$r1y, col = "DarkBlue")
+```
+
+We merge the two
+
+```{r merge_rates}
+mer <- merge(mer, tress[, c("date", "r1y")], by = "date")
+nrow(mer)
+setkey(mer, permno, date)
+```
+
+We split the data into different R processes
+
+<!-- see https://stackoverflow.com/a/31075231/5861244 -->
+
+```{r split_dat, message = FALSE}
+#####
+# split data
+n_threads <- 6L
+invisible(mer[, par_idx := sample.int(n_threads, 1), by = permno])
+
+library(parallel)
+cl <- makeCluster(n_threads)
+for(i in seq_len(n_threads)){
+  clusterCall(cl[i], function(x) {
+    library(data.table)
+    assign('mydata', x, pos=.GlobalEnv)
+    .GlobalEnv$mydata[, par_idx := NULL]
+    NULL
+  }, subset(mer, par_idx == i))
+}
+
+# confirm that we have the same number of rows
+invisible(mer[, par_idx := NULL])
+stopifnot(sum(unlist(clusterEvalQ(cl, nrow(mydata)))) == nrow(mer))
+
+local({
+  perms <- lapply(clusterEvalQ(cl, mydata$permno), unique)
+  stopifnot(setequal(unique(mer$permno), unique(unlist(perms))))
+  for(i in seq_len(n_threads - 1L))
+    stopifnot(length(intersect(perms[[i]], unlist(perms[-(1:i)]))) == 0L)
+})
+```
+
+Compute estimates of the volatility and mean of the underlying asset
+
+<!--
+
+  knitr::opts_knit$set(output.dir = ".")
+  knitr::load_cache("comp_dtd", path = 
+     paste0(file.path("markdown", "cache", "distance-to-default"), .Platform$file.sep))
+
+-->
+
+```{r comp_dtd, cache = 1}
+# we have a one-to-one link
+stopifnot(max(mer[, length(unique(permno)), by = .(gvkey, ym)]$V1) == 1L)
+stopifnot(max(mer[, length(unique(gvkey)), by = .(permno, ym)]$V1) == 1L)
+
+# compute distance to default
+invisible(clusterEvalQ(cl, {
+  # use data.table instead and make sure that data is sorted
+  library(data.table)
+  library(DtD)
+  setkey(mydata, permno, date)
+  
+  # compute distance-to-default
+  invisible(mydata[, time := as.numeric(date) / 365])
+  func <- function(.SD){
+    # compute mu and sigma
+    out <- BS_fit_rolling(
+      S = .SD$mv / 1000, D = .SD$debt, T. = 1, time = .SD$time, r = .SD$r1y, 
+      grp = .SD$ym, method = "iterative", width = 12L, min_obs = 21L * 3L, 
+      tol = 1e-8, eps = 1e-5)
+    
+    # turn into list of vectors
+    tmp <- split(out, rep(1:ncol(out), each = nrow(out)))
+    names(tmp) <- colnames(out)
+    tmp
+  }
+  dist_dat <- mydata[, func(.SD), by = permno]
+  NULL
+}))
+
+# gather output
+dist_iterative <- do.call(rbind, clusterEvalQ(cl, dist_dat))
+```
+
+```{r stop_cl, echo = FALSE}
+stopCluster(cl)
+```
+
+Check result
+
+```{r check_dtd}
+# which had too few and which failed?
+mean(is.na(dist_iterative$success))
+mean(dist_iterative$n_obs < 21L * 3L)
+mean(ifelse(is.na(dist_iterative$success), 1, dist_iterative$success)  < 1)
+```
+
+Remove rows with missing values
+
+```{r check_dtd_re_check}
+dist_iterative <- dist_iterative[!is.na(mu) & !is.na(vol), ]
+```
+
+Merge data sets
+
+```{r merge_dtd}
+# assumptions
+stopifnot(
+  all(complete.cases(mer)), inherits(mer, "data.table"),
+  all(complete.cases(dist_iterative[, .(permno, vol)])))
+
+setkey(mer, permno, ym, date)
+invisible(mer[, is_last := 1:.N == .N, by = .(permno, ym)])
+
+final <- merge(
+  mer[is_last == TRUE, ], 
+  dist_iterative[, .(permno, grp, vol, success, mu)], 
+  by.x = c("permno", "ym"), by.y = c("permno", "grp"), all = FALSE)
+nrow(final)
+
+stopifnot(nrow(final) == nrow(dist_iterative), all(final$debt > 0),
+          all(final$mv > 0))
+```
+
+Compute distance-to-default
+
+```{r comp_dtd_final}
+library(DtD)
+final[
+  , V := get_underlying(
+    S = mv / 1000, D = debt, r = r1y, T. = 1, vol = vol, tol = 1e-12)]
+final[, dtd := (log(V) - log(debt) + (mu - vol^2/2)) / vol]
+```
+
+Make plots of aggregate measures
+
+```{r show_final_ests}
+local({
+  #####
+  # number of observations
+  tmp <- copy(final)
+  tmp$grp <- make_ym_inv(as.integer(tmp$ym + sign(tmp$ym) * 1e-8))
+  x <- xtabs(~ tmp$grp)
+  plot(as.vector(x) ~ as.Date(names(x)), type = "l",
+       xlab = "Year", ylab = "Number of observations")
+  
+  #####
+  # sigma
+  cat("Mean and sd of sigma are\n")
+  print(tmp[, c(mean(vol), sd(vol))])
+  
+  t1 <- tmp[
+    , .(mean = mean(vol), se = sd(vol) / sqrt(length(vol))), keyby = grp]
+  
+  lb <- t1$mean - 1.96 * t1$se
+  ub <- t1$mean + 1.96 * t1$se
+  plot(t1$mean ~ t1$grp, pch = 16, ylim = range(lb, ub), xlab = "Year",
+       ylab = expression(sigma))
+  segments(t1$grp, lb, t1$grp, ub, col = rgb(0, 0, 0, .25))
+  
+  #####
+  # distance to default
+  cat("Mean and sd of distance-to-default are (the trimmed mean is ",
+      mean(tmp$dtd, trim = .01), ")\n", sep = "")
+  print(tmp[, c(mean(dtd), sd(dtd))])
+  
+  t2 <- tmp[
+    , .(mean = mean(dtd), se = sd(dtd) / sqrt(length(dtd))), keyby = grp]
+  
+  lb <- t2$mean - 1.96 * t2$se
+  ub <- t2$mean + 1.96 * t2$se
+  plot(t2$mean ~ t2$grp, pch = 16, ylim = range(lb, ub), xlab = "Year",
+       ylab = "DtD")
+  segments(t2$grp, lb, t2$grp, ub, col = rgb(0, 0, 0, .25))
+  
+  #####
+  # distance to default winsorized
+  tmp[, dtd_winz := pmin(pmax(dtd, quantile(dtd, .01)), quantile(dtd, .99))]
+  cat("Mean and sd of winsorized distance-to-default\n")
+  print(tmp[, c(mean(dtd_winz), sd(dtd_winz))])
+  
+  t2 <- tmp[
+    , .(mean = mean(dtd_winz), se = sd(dtd_winz) / sqrt(length(dtd_winz))),
+    keyby = grp]
+  
+  lb <- t2$mean - 1.96 * t2$se
+  ub <- t2$mean + 1.96 * t2$se
+  plot(t2$mean ~ t2$grp, pch = 16, ylim = range(lb, ub), xlab = "Year",
+       ylab = "DtD")
+  segments(t2$grp, lb, t2$grp, ub, col = rgb(0, 0, 0, .25))
+})
+```
+
+Maybe compare with the summary stats in @Bharath08 [pp. 1352], 
+@Chava11 [pp. 1272], @Lando10 [pp. 360], and @Lando13 [pp. 466].
+
+Save the data set
+
+```{r save_final}
+saveRDS(as.data.frame(final), file.path("data", "distance-to-default.RDS"))
+```
+
+# References

@@ -1,0 +1,12 @@
+*
+!\.gitignore
+!.Placeholder
+!CRSP/
+CRSP/*
+!CRSP/.Placeholder
+!CRSP/daily_stock/
+CRSP/daily_stock/*
+!CRSP/daily_stock/.Placeholder
+!CRSP/monthly_stock/
+CRSP/monthly_stock/*
+!CRSP/monthly_stock/.Placeholder

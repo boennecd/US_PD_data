@@ -1,0 +1,493 @@
+---
+title: "Market data"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:  
+  html_document:
+    toc: true
+bibliography: refs.bib
+---
+
+<script>
+$(document).ready(function(){
+  var hide_divs = $("div.hideable");
+  hide_divs.each(function(){
+    // Wrap content in div
+    $(this).wrapInner( "<div class='hideable_content', style='display: none;'></div>");
+    
+    // Add button
+    $(this).prepend("<button id='toogle'>show</button>");
+  });
+  
+  // Add hideable btn
+  // Put the rest in a div
+  
+  $("div.hideable button#toogle").click(function(){
+    var parent = $(this).parent();
+    var target_div = $(parent).find("div.hideable_content");
+    
+    if(target_div.css("display") == "none"){
+      target_div.show();
+        $(this).text("Hide");
+    } else {
+      target_div.hide();
+      $(this).text("Show");
+    }
+  });
+});
+</script>
+
+## Load data
+
+```{r static_setup, include=FALSE, cache=FALSE}
+# please do not set options here that could change...
+knitr::opts_chunk$set(
+  cache.path = 
+    paste0(file.path("cache", "market-data"), .Platform$file.sep), 
+  fig.path = 
+    paste0(file.path("fig"  , "market-data"), .Platform$file.sep))
+```
+
+```{r def_data_files}
+# assign file names
+fs <- list(
+  daily    = file.path("data", "CRSP", "daily_stacked.RDS"), 
+  monthly  = file.path("data", "CRSP", "monthly_stacked.RDS"),
+  index    = file.path("data", "index_self.RDS"),
+  index_o  = file.path("data", "index.RDS"),
+  ym_R     = file.path("R", "ym.R"), 
+  map_file = file.path("data", "moody-compu-link.RDS"))
+```
+
+```{r check_rebuild, echo = FALSE, cache = TRUE, cache.extra = tools::md5sum(unlist(fs))}
+# see https://stackoverflow.com/a/52163751/5861244
+knitr::opts_chunk$set(cache.rebuild = TRUE)
+```
+
+```{r setup, include=FALSE, cache=FALSE}
+# please do set options here that could change...
+knitr::opts_chunk$set(
+  echo = TRUE, fig.height = 4, fig.width = 7, dpi = 128, comment = "#R", 
+  error = FALSE)
+options(digits = 4, scipen = 10, width = 70)
+```
+
+```{r load_dat}
+daily <- readRDS(fs$daily)
+monthly <- readRDS(fs$monthly)
+```
+
+Keep only the permno we need 
+
+```{r keep_needed}
+# Get the list of permnos and permco to keep
+map_obj <- readRDS(fs$map_file)
+gvkey_keep <- unique(map_obj$gvkey)
+permno_keep <- with(monthly, unique(permno[gvkey %in% gvkey_keep]))
+
+# subset 
+monthly <- subset(monthly, permno %in% permno_keep)
+daily   <- subset(daily  , permno %in% permno_keep)
+
+rm(map_obj, monthly)
+```
+
+Make year month variables
+
+```{r source_ym}
+source(fs$ym_R)
+daily$ym <- make_ym(daily$date)
+```
+
+Load the index data
+
+```{r load_idx}
+idx <- readRDS(fs$index)$data
+
+idx_o <- readRDS(fs$index_o)
+colnames(idx_o)[colnames(idx_o) %in% c("caldt", "vwretd")] <- 
+  c("date", "vwret")
+stopifnot(all(idx$date %in% idx_o$date))
+
+# keep only the columns we need
+idx <- merge(idx[, c("date", "market_size")], idx_o[, c("date", "vwret")], 
+             by = "date")
+rm(idx_o)
+```
+
+Merge the data sets
+
+```{r merge}
+library(data.table)
+daily <- data.table(daily)
+stopifnot(all(daily$date %in% idx$date))
+mer <- merge(daily, idx, by = "date")
+setkey(mer, permno, ym, date)
+
+# clean up 
+rm(daily)
+```
+
+# Estimate standard deviation from rolling regression
+As in @Shumway01, we compute the idiosyncratic-risk by regressing
+the stock return on the index and save the estimated standard deviation. We 
+also save the $R^2$s and $\beta$s to check if the results make sense.
+
+```{r comp_sigma}
+# Get non-NA return columns
+mer_sub <- mer[!is.na(ret), ]
+setkey(mer_sub, permno, ym, date)
+nrow(mer) - nrow(mer_sub)
+
+func <- function(SD){
+  min_obs <- 20L * 3L
+  if(nrow(SD) < min_obs){
+    fail_out <- rep(NA_real_, nrow(SD))
+    fail_out <- list(fail_out, fail_out, fail_out)
+    return(fail_out)
+    
+  }
+  
+  require(rollRegres)
+  out <- suppressWarnings(roll_regres.fit(
+    x = cbind(1, SD$vwret), y = SD$ret, width = 12L, 
+    do_compute = c("sigmas", "r.squareds"),
+    do_downdates = TRUE, grp = SD$ym, min_obs = min_obs))
+  
+  if(is.null(out))
+    return(out)
+  
+  list(out$coefs[, 2], out$sigmas, out$r.squareds)
+}
+invisible(mer_sub[, c("beta", "sigma", "r_square") := func(.SD), by = permno])
+
+# keep only the most recent figure each month
+setkey(mer_sub, permno, ym, date)
+invisible(mer_sub[, is_last := 1:.N == .N, by = .(permno, ym)])
+mer_sub <- mer_sub[is_last == TRUE]
+```
+
+Check if the result is as expected. We start with plots
+
+<div class="hideable">
+
+```{r check_regress_res}
+local({
+  #####
+  # number of observations
+  nobs <- mer_sub[, .(nobs = sum(!is.na(sigma))), by = ym]
+  nobs[, date := make_ym_inv(ym)]
+  plot(nobs$nobs ~ nobs$date)
+  
+  #####
+  # means
+  tmp <- mer_sub[, .(
+    beta     = mean(beta    , na.rm = TRUE), 
+    sigma    = mean(sigma   , na.rm = TRUE), 
+    r_square = mean(r_square, na.rm = TRUE)), by = ym]
+  
+  tmp[, date := make_ym_inv(ym)]
+  par(mfcol = c(2, 2), mar = c(4.5, 4.5, .5, .5))
+  plot(tmp$beta ~ tmp$date)
+  plot(tmp$sigma ~ tmp$date)
+  plot(tmp$r_square ~ tmp$date)
+  
+  #####
+  # standard deviations
+  tmp <- mer_sub[, .(
+    beta     = sd(beta    , na.rm = TRUE), 
+    sigma    = sd(sigma   , na.rm = TRUE), 
+    r_square = sd(r_square, na.rm = TRUE)), by = ym]
+  
+  tmp[, date := make_ym_inv(ym)]
+  par(mfcol = c(2, 2), mar = c(4.5, 4.5, .5, .5))
+  plot(tmp$beta ~ tmp$date)
+  plot(tmp$sigma ~ tmp$date)
+  plot(tmp$r_square ~ tmp$date)
+  
+  #####
+  # some high quantile
+  tmp <- mer_sub[, .(
+    beta     = quantile(beta    , na.rm = TRUE, probs = .9), 
+    sigma    = quantile(sigma   , na.rm = TRUE, probs = .9), 
+    r_square = quantile(r_square, na.rm = TRUE, probs = .9)), by = ym]
+  
+  tmp[, date := make_ym_inv(ym)]
+  par(mfcol = c(2, 2))
+  plot(tmp$beta ~ tmp$date)
+  plot(tmp$sigma ~ tmp$date)
+  plot(tmp$r_square ~ tmp$date)
+})
+```
+
+</div>
+
+Then overall summary statistics
+
+```{r check_regress_res_stats}
+local({
+  for(x in c("beta", "sigma", "r_square")){
+    z <- mer_sub[[x]]
+    msg <- sQuote(x)
+    cat(msg, "\n", rep("-", nchar(msg)), "\n", sep = "")
+    print(summary(z[!is.na(z)]))
+    cat("\n")
+  }
+})
+```
+
+Compare with summary statistics in @Shumway01 [pp. 114] (though he uses 
+monthly data), @Campbell08 [pp. 2907], and @Duan12 [pp. 196]. 
+
+We only need the standard deviations so we drop the other variables
+
+```{r sigma_drop other}
+invisible(mer_sub[, `:=`(
+  date = NULL, mv = NULL, ret = NULL, market_size = NULL, vwret = NULL, 
+  beta = NULL, r_square = NULL, is_last = NULL)])
+sigma_vals <- mer_sub[!is.na(sigma)]
+rm(mer_sub)
+```
+
+## Relative marked value
+
+We compute the relative marked value in this section
+
+```{r rel_marked_value}
+mer_sub <- mer[, .(permno, ym, date, mv, market_size)]
+setkey(mer_sub, permno, ym, date)
+
+func <- function(mv, idx){
+  # find the most recent non-na MV. Works if data is sorted
+  latest_non_na <- which.max(which(!is.na(mv)))
+  if(length(latest_non_na) == 0L)
+    return(rep(NA_real_, length(mv)))
+  rep(log(mv[latest_non_na]) - log(idx[latest_non_na]), length(mv))
+}
+invisible(mer_sub[, rel_size := func(mv, market_size), by = .(permno, ym)])
+
+# only keep one observation per month and remove some variables
+rel_size <- mer_sub[, is_last := .N == 1:.N, by = .(permno, ym)][
+  is_last == TRUE][
+    , `:=`(is_last = NULL, mv = NULL, date = NULL, market_size = NULL)]
+rm(mer_sub)
+```
+
+Check result
+
+<div class="hideable">
+
+```{r rel_marked_value_check}
+local({
+  tmp <- copy(rel_size)
+  tmp[, date := make_ym_inv(ym)]
+  
+  t1 <- tmp[, .(`frac na` = mean(is.na(rel_size))), by = date]
+  with(t1, plot(`frac na` ~ date))
+  
+  tmp <- tmp[!is.na(rel_size)]
+  t1 <- tmp[, .(mean = mean(rel_size), sd = sd(rel_size)), by = date]
+  with(t1,{
+    plot(mean ~ date)
+    plot(sd   ~ date)
+  })
+
+  cat("summary\n")  
+  print(summary(tmp$rel_size))
+  
+  cat("sd\n")
+  print(sd(tmp$rel_size))
+})
+```
+
+</div>
+
+Compare with summary statistics in @Campbell08 [pp. 2907], 
+@Chava11 [pp. 1272], and @Duan12 [pp. 196]. 
+
+## Excess returns
+
+We load in the monthly data and keep the variables we need
+
+<div class="hideable">
+
+```{r load_n_prep_monthly}
+monthly <- readRDS(fs$monthly)
+monthly <- subset(monthly, permno %in% permno_keep)
+
+monthly <- data.table(monthly)
+invisible(monthly[, `:=`(ret_log = log1p(ret), ym = make_ym(date))])
+stopifnot(all(monthly[, length(unique(date)), by = .(permno, ym)]$V1 == 1L))
+monthly <- monthly[, c("cusip", "permno", "gvkey", "ym", "ret_log")]
+
+# check plot
+local({
+  tmp <- monthly[, .(mean = mean(ret_log, na.rm = TRUE)), by = ym]
+  plot(tmp$mean ~ make_ym_inv(tmp$ym), type = "h")
+})
+```
+
+</div>
+
+We compute the log monthly returns for the index data
+
+<div class="hideable">
+
+```{r compute_idx_log_return}
+# compute log return 
+idx <- data.table(idx)
+setkey(idx, date)
+invisible(idx[
+  , ym := make_ym(date)][
+    , `:=`(is_last =  1:.N == .N, 
+           vwret_log_m = sum(log1p(vwret))), 
+    by = ym])
+idx_month <- idx[is_last == TRUE][, is_last := NULL]
+idx$is_last <- NULL
+setkey(idx_month, ym)
+
+setnames(idx_month, "vwret_log_m", "vwret_log")
+
+# plot monthly return of index
+par(mfcol = c(1, 2))
+with(idx_month, plot(vwret_log ~ make_ym_inv(ym), type = "h"))
+with(idx_month, 
+     plot(cumsum(vwret_log[-1]) ~ make_ym_inv(ym[-1]), type = "l"))
+
+# merge the two
+monthly <- merge(monthly, idx_month[, .(ym, vwret_log)], by = "ym")
+```
+
+</div>
+
+Compute average annualized difference
+
+```{r comp_excess_ret}
+func <- function(log_diff, ym, min_obs = 3L, width = 12L){
+  out <- rep(NA_real_, length(log_diff))
+  
+  if(length(ym) < min_obs)
+    return(out)
+  
+  ym <- ym - min(ym) + 1L # set `min(ym)` to one
+  start_val <- min(which(ym >= min_obs))
+  for(i in start_val:length(ym)){
+    y <- ym[i]
+    keep <- which(ym %in% (y - width + 1L):y)
+    if(length(keep) < min_obs)
+      next
+    x <- log_diff[keep]
+    x <- x[!is.na(x)]
+    if(length(x) < min_obs)
+      next
+    out[i] <- mean(x) * 12 # annualize
+  }
+  
+  out
+}
+setkey(monthly, permno, ym)
+invisible(monthly[, excess_ret := func(ret_log - vwret_log, ym), by = permno])
+```
+
+Check result
+
+<div class="hideable">
+
+```{r comp_excess_ret_check}
+local({
+  #####
+  # fraction of missing observations
+  tmp <- monthly[, .(`frac na` = mean(is.na(excess_ret))), by = ym]
+  par(mfcol = c(1, 2))
+  with(tmp, {
+    plot(`frac na` ~ make_ym_inv(ym))
+    plot(`frac na` ~ make_ym_inv(ym), ylim = c(0, .15))
+    })
+  
+  #####
+  # mean, sd, and some high quantile
+  tmp <- monthly[, .(mean =     mean(excess_ret, na.rm = TRUE), 
+                     sd   =       sd(excess_ret, na.rm = TRUE),
+                     q95  = quantile(excess_ret, na.rm = TRUE, probs = .95)), 
+                 by = ym]
+  par(mfcol = c(2, 2), mar = c(4.5, 4.5, .5, .5))
+  with(tmp, {
+    plot(mean ~ make_ym_inv(ym))
+    plot(  sd ~ make_ym_inv(ym))
+    plot( q95 ~ make_ym_inv(ym))
+  })
+  
+  #####
+  # summary stats
+  cat("Summary stats before winsorizing\n")
+  tmp <- monthly[!is.na(excess_ret), excess_ret]
+  print(summary(tmp))
+  cat("sd", sd(tmp), "\n\n")
+  
+  cat("Summary stats after winsorizing\n")
+  tmp <- pmin(pmax(tmp, quantile(tmp, .05)), quantile(tmp, .95))
+  print(summary(tmp))
+  cat("sd", sd(tmp), "\n\n")
+})
+```
+
+</div>
+
+Compare with @Shumway01 [pp. 114] (though he does not have firms listed on NASDAQ), 
+@Campbell08 [pp. 2907], and @Chava11 [pp. 1272]. 
+
+## Merge data sets
+
+We start by merging with a outer join 
+
+```{r merge_dat}
+rm(mer, idx, idx_month) # we do not need these anymore
+
+monthly <- monthly[, c("ym", "cusip", "permno", "gvkey", "excess_ret")]
+mer <- merge(monthly, sigma_vals, by = c("permno", "ym"), all = TRUE)
+mer <- merge(mer    , rel_size  , by = c("permno", "ym"), all = TRUE)
+c(nrow(monthly), nrow(sigma_vals), nrow(rel_size), nrow(mer))
+```
+
+We have some missing values and some that lag identifies. The latter is due 
+to the outer join 
+
+```{r check_frac_missing}
+mer[, lapply(.SD, function(x) mean(is.na(x))), 
+    .SD = c("excess_ret", "sigma", "rel_size", "gvkey")]
+
+# we only want to keep those where we can match 
+mer <- mer[!is.na(gvkey)]
+mer[, lapply(.SD, function(x) mean(is.na(x))), 
+    .SD = c("excess_ret", "sigma", "rel_size", "gvkey")]
+nrow(mer)
+length(unique(mer$permno))
+```
+
+We only have maps to `gvkey`s through the monthly data. We have not thrown away 
+any of the `gvkey` year months as shown below
+
+```{r no_throw_gvkey_ym}
+local({
+  # load monthly data and find those that will be included
+  map_obj <- readRDS(fs$map_file)
+  gvkey_keep <- unique(map_obj$gvkey)
+  gvkey_keep <- subset(readRDS(fs$monthly), gvkey %in% gvkey_keep, 
+                       select = c(gvkey, date))
+  gvkey_keep$ym <- make_ym(gvkey_keep$date)
+  
+  # merge with mer, adding a dummy which we can check if any are NA after
+  tmp <- merge(
+    gvkey_keep, 
+    with(mer, data.frame(gvkey, ym, is_mer = TRUE)), 
+    by = c("gvkey", "ym"), all = TRUE)
+  stopifnot(!anyNA(tmp$is_mer))
+})
+```
+
+Save result
+
+```{r save_res}
+saveRDS(as.data.frame(mer), file.path("data", "market-datat.RDS"))
+```
+
+# References

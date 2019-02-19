@@ -1,0 +1,1745 @@
+---
+title: "Mapping Moody's and CRSP-Compustat"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+bibliography: refs.bib
+---
+
+<script>
+$(document).ready(function(){
+  var hide_divs = $("div.hideable");
+  hide_divs.each(function(){
+    // Wrap content in div
+    $(this).wrapInner( "<div class='hideable_content', style='display: none;'></div>");
+    
+    // Add button
+    $(this).prepend("<button id='toogle'>show</button>");
+  });
+  
+  // Add hideable btn
+  // Put the rest in a div
+  
+  $("div.hideable button#toogle").click(function(){
+    var parent = $(this).parent();
+    var target_div = $(parent).find("div.hideable_content");
+    
+    if(target_div.css("display") == "none"){
+      target_div.show();
+        $(this).text("Hide");
+    } else {
+      target_div.hide();
+      $(this).text("Show");
+    }
+  });
+});
+</script>
+
+```{r static_setup, include=FALSE, cache=FALSE}
+# please do not set options here that could change...
+knitr::opts_chunk$set(
+  cache.path = paste0(file.path("cache", "mapping"), .Platform$file.sep), 
+  fig.path   = paste0(file.path("fig"  , "mapping"), .Platform$file.sep))
+```
+
+```{r def_data_files}
+# assign file names
+fs <- list(
+  compu = file.path("data", "compustat.RDS"), 
+  moody = file.path("data", "moody-issuer.RDS"))
+```
+
+```{r check_rebuild, echo = FALSE, cache = TRUE, cache.extra = tools::md5sum(unlist(fs))}
+# see https://stackoverflow.com/a/52163751/5861244
+knitr::opts_chunk$set(cache.rebuild = TRUE)
+```
+
+```{r setup, include=FALSE, cache=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  fig.height = 4, fig.width = 7, dpi = 128, comment = "#R", error = FALSE)
+options(digits = 4, scipen = 10, width = 70)
+```
+
+The goal in this file is to create a mapping between Moody's and Compustat.
+
+## Load data
+
+```{r load_dat}
+compu <- readRDS(fs$compu)$data
+moody <- readRDS(fs$moody)
+```
+
+## Map using CUSIP
+We start by using CUSIP. First, we start with some useful information
+
+> CUSIP stands for Committee on Uniform Securities Identification Procedures. 
+Formed in 1962, this committee developed a system (implemented in 1967) that 
+identifies securities, specifically U.S. and Canadian registered stocks, and 
+U.S. government and municipal bonds.
+
+According to http://www.investopedia.com/ask/answers/04/040704.asp. Further, 
+
+> The first six characters are known as the base (or CUSIP-6), and uniquely 
+identify the issuer. Issuer codes are assigned alphabetically from a series 
+that includes deliberate built-in "gaps" for future expansion. The 7th and 8th 
+digit identify the exact issue. The 9th digit is an automatically generated 
+checksum (some clearing bodies ignore or truncate the last digit). The last 
+three characters of the issuer code can be letters, in order to provide more 
+room for expansion.
+
+According to https://en.wikipedia.org/wiki/CUSIP. Lastly, the following remarks about the CUSIP number may be of interest:
+
+> Within Compustat, the first six characters of the CUSIP are referred to as 
+the CNUM (CUSIP issuer code), and the last three characters of the CUSIP are 
+called the CIC (CUSIP issue code). Throughout much of the history of Compustat 
+data files, the CNUM was used as a company identifier, but it has recently been 
+supplanted in this function by the gvkey. In any event, the Compustat files do 
+not track a company's CUSIP history. Rather, only the most recent CUSIP or CNUM 
+is included.
+
+The source is 
+http://studerende.au.dk/fileadmin/www.asb.dk/servicekatalog/IT/Analysevaerktoejer/Finansielle_Databaser/Manual_WRDS_Compustat_Global.pdf. 
+It is important to note that:
+
+> Permno 68814: Difference in CUSIP
+Permno 68814 stopped trading on 2002-07-09. Since the reverse split occurred 
+in 2004, CRSP did not track the CUSIP change. They do not plan to update the 
+CUSIP unless the security plans to trade again.
+>
+> Compustat has only the current, active CUSIP.
+
+Source: https://wrds-web.wharton.upenn.edu/wrds/support/Additional%20Support/WRDS%20Knowledge%20Base%20with%20FAQs.cfm?folder_id=658&article_id=2713
+
+We show some of the properties of the two columns below
+
+```{r cusip_props}
+######
+# Compustat
+head(compu$cusip, 10)
+
+with(compu, stopifnot(
+  # we have more than one record per firm  
+  any(xtabs(~ gvkey) > 1),
+  # but the cusip is the same
+  all(tapply(cusip, gvkey, function(x) length(unique(x))) == 1L)))
+
+# make gvkey-cusip table
+library(data.table)
+compu <- data.table(compu)
+compu_cusip <- compu[, .(cusip = cusip[1]), by = gvkey]
+
+#####
+# Moody
+
+# We need to prepare the Moody's values
+# The possible external maps in the Moody's data are in the external_maps value
+# We extract the type of the map with the following regexp
+get_external_maps <- function(x){
+  stopifnot(length(x) == 1L)
+  require(stringr)
+  keys <- str_extract_all(x, "(?<=(;\\ ')|^').+?(?=':'.+'(;|$))")[[1]]
+  vals <- str_extract_all(x, "(?<=':').+?(?='($|;\\ ))")[[1]]
+  list(key = keys, val = vals)
+}
+moody$external_maps[1]
+get_external_maps(moody$external_maps[1])
+moody$external_maps[2]
+get_external_maps(moody$external_maps[2])
+
+moody <- data.table(moody)
+stopifnot(!anyDuplicated(moody$mast_issr_num))
+moody_maps <- moody[, get_external_maps(external_maps), by = mast_issr_num]
+head(moody_maps, 10)
+unique(moody_maps$key)
+```
+
+We only need the CUSIP data from Moody's for now and the first six chars from 
+the Compustat CUSIP
+
+```{r prep_cusip}
+moody_maps_cusip <- moody_maps[key == "Issuer part of CUSIP number"]
+stopifnot(all(nchar(moody_maps_cusip$val) == 6L), 
+          nchar(compu_cusip$cusip) >= 6L)
+
+invisible(compu_cusip[, cusip := substr(cusip, 1L, 6L)])
+```
+
+Left join and check matches
+
+```{r cusip_match}
+# both have duplicates so we can have a many-to-many relation
+stopifnot(
+  anyDuplicated(moody_maps_cusip$val) > 0L, 
+  anyDuplicated(compu_cusip$cusip)    > 0L)
+
+cusip_match <- merge(
+  moody_maps_cusip[, .(mast_issr_num, val)], 
+  compu_cusip, by.x = "val", by.y = "cusip")
+nrow(cusip_match)
+```
+
+Throw out duplicates and save these to a potential list
+
+```{r cusip_remove_dups}
+invisible(cusip_match[
+  , n1 := .N, by = gvkey][, n2 := .N, by = mast_issr_num][
+    , has_more := n1 > 1L | n2 > 1L][, `:=`(n1 = NULL, n2 = NULL)])
+sum(cusip_match$has_more)
+
+potential_matches <- cusip_match[has_more == TRUE]
+cusip_match <- cusip_match[has_more == FALSE][, has_more := NULL]
+nrow(cusip_match)
+```
+
+Add the names to them and check that the results makes sense from the names
+
+<div class="hideable">
+
+```{r cusip_match_check}
+local({
+  tmp <- copy(cusip_match)
+  tmp <- merge(
+    tmp, moody[
+      , .(issuer_nam = issuer_nam[1]), by = mast_issr_num], 
+    by = "mast_issr_num")
+  tmp <- merge(
+    tmp, compu[, .(conm = conm[1]), by = gvkey], by = "gvkey")
+  
+  # sample random rows
+  tmp <- tmp[sample.int(nrow(tmp), 100), ]
+  print(t(as.matrix(tmp[, .(issuer_nam, conm)])))
+})
+```
+
+</div>
+
+We remove the firms from the list of potential firms
+
+```{r rm_cusip_potent}
+compu_res <- compu[!gvkey %in% cusip_match$gvkey]
+moody_res <- moody[!mast_issr_num %in% cusip_match$mast_issr_num]
+```
+
+## Mapping with ticker symbol
+
+We can also try to map with the equity ticker symbol. The `compu_res$tic`  
+needs some processing. We go through the various conventions below. A TODO is 
+added when I am not sure if the comment following after the TODO is right. 
+`XYZ` means that we expect a series of letters like `A`, `DT`, `HBO` etc. 
+`#` is used when a any number could be present. `@` is used for a single alpha 
+character.
+
+<div class="hideable">
+
+> This item [tic] identifies the symbol associated with trading of a particular 
+issue on an exchange. This field is blank for issues trading on exchanges where 
+this concept is not applicable. Not all issues have a Trading Symbol. A 
+parent-company ticker is followed by a number (i.e. EGN1 for Alabama Gas Corp) 
+indicates a subsidiary of a publicly traded company.
+
+So we want patterns that match `XYZ` and `XYZ#`
+
+> Duplicate U.S./Canadian ticker symbols
+>
+> Examples: A, A.
+> 
+> U.S. and Canadian companies may share the same ticker symbol. In this case, 
+Standard & Poor's adds a period (.) at the end of the Canadian ticker symbol. 
+For example:
+>
+> Barnes Group Inc. (U.S. company) B
+> 
+> BCE Inc. (Canadian company) B.
+
+So we do **not** want patterns that match `XYZ.`
+
+> Canadian Inactive
+> 
+> Examples: ABC._
+>
+> When a Canadian company becomes inactive, an underscore (_) is added to the 
+end of the ticker symbol. For example:
+> 
+> AMB. changes to AMB._
+
+So we do **not** want patterns that match `XYZ._`. Other Canadian suffixes are 
+`.H`, `.LV`, `.MV`, `.NV`, `.RV`, `.SV`, `.Z` and `.U`
+
+> Class C Shares
+>
+> Examples: ABC.C
+
+TODO: So we want patterns that match `XYZ.C`
+
+> Delisted Companies
+> 
+> Examples: ABC.Z
+> 
+> When a security has been delisted by the TSX or TSX-V exchanges, a (.Z) is 
+appended to the ticker symbol. The (.Z) is used less frequently for U.S. 
+exchanges to indicate that the company has been delisted, often after being 
+acquired.
+
+TODO: So we do want **some** patterns that match `XYZ.Z`
+
+> Duplicate Active/Inactive Companies
+>
+> Examples: ABC ABC. ABC.1
+> 
+> Active and inactive (research) companies may have duplicate ticker symbols. 
+In this case, the active company will carry the ticker symbol obtained from 
+the S&P Stock Guide or the NASDAQ system, and the inactive company will have 
+a period (.) at the end of the ticker symbol. For example:
+>
+> Dime Community Bancshares (active) DCOM
+>
+> Dicomed Corp. (research) DCOM.
+>
+> Note: When multiple research companies have the same original ticker symbol, 
+a .1 is added to the end of the ticker symbol of the company most recently added. 
+
+So we want patterns that match `XYZ.`, `XYZ.#`
+
+> Emerging Market Companies on ASE
+>
+> Examples: ABC.EC
+>
+> Emerging market companies that trade on the American Stock Exchange and were 
+allowed to meet lower listing requirements than other companies on the ASE are 
+assigned ticker symbols ending with (.EC). For example:
+>
+> Encore Marketing Int'l Inc. EMI.EC
+
+TODO: So we want patterns that match `XYZ.EC`
+
+> Leveraged Buyouts
+>
+> Examples: 1234C
+>
+> Special tickers are assigned to companies that have undergone leveraged 
+buyouts but continue to file reports. The special tickers consist of four 
+digits followed by a (C). For example:
+>
+> Formica Corp. 6061C
+>
+> Parisian Inc. 6055C
+
+TODO: So we do **not** want patterns that match `####C`
+
+> NASDAQ Fifth Character
+>
+> All security symbols on the NASDAQ Exchanges are either four or five letters 
+long. A fifth letter means the security is something other than an issue of 
+common or capital stock.
+>
+> ADB Systems Intl Ltd. 3ADBYF
+>
+> All State Properties - LP 3ATPTZ
+
+TODO: So we want patterns that match `3@@@@`, `@@@@`, `@@@@[AMEX/NYSE symbol]` 
+and `3@@@@[AMEX/NYSE symbol]`. The fifth symbol can be found in the table 
+further down. I conclude this after reading this post 
+http://www.investopedia.com/ask/answers/06/nasdaqfifthletter.asp
+
+These are
+
+|   |   |    |
+|---|---|----|
+| A | K | U  |
+| B | L | V  |
+| C | M | W  |
+| D | N | X  |
+| E | O | Y  |
+| F | P | Z  |
+| G | Q |    |
+| H | R |    |
+| I | S |    |
+| J | T |    |
+
+> NASDAQ and OTCBB late filing
+>
+> Examples: ABC.E
+>
+> When a company files its 10-K or 10-Q late, an ".E" suffix is added to the 
+ticker symbol. The suffix may be removed when the company files again or when 
+it is moved an OTHOTC listing.
+
+So we do want **some** patterns that match `XYZ.E`
+
+> NASDAQ reverse merger or spin-off
+>
+> Examples: ABC.D
+>
+> Used to indicate the surviving entity in a reverse merger or spin-off. The 
+entity is a new company, although the ticker symbol and company name may not 
+change.
+
+TODO: So we do want **some** patterns that match `XYZ.D`
+
+> NEX listing
+>
+> Examples: ABC.H
+>
+> Indicates shares traded on the NEX (a separate board of the TSX Venture 
+Exchange). (See also CNQ).
+
+So we do **not** want patterns that match `XYZ.H`
+
+> Non-trading companies with trading divisions
+>
+> Examples: ABXY.CM
+>
+> Special tickers are assigned to non-trading companies whose financials 
+represent consolidated statements of two other divisions that actively trade 
+and file separate financial reports. Special tickers consist of four 
+characters; two characters are from one division's ticker symbol and two 
+characters are from the other division's ticker symbol. The ticker is followed 
+by (.CM). For example:
+>
+> Unilever Combined UNUL.CM
+>
+> Unilever N V - NY Shares UN
+> Unilever PLC - Amer Shares UL
+
+TODO: So we do **not** want patterns that match `XYZ.CM`
+
+> Non-trading Issues ? Private or Debt-Only
+>
+> Examples: 1234B
+>
+> Pseudo-ticker symbols are assigned to private companies, companies that 
+issue debt only, co-ops, limited partnerships and red herring companies that 
+have not yet applied for a ticker symbol. These special tickers consist of 
+four digits followed by a (B). For example:
+>
+> Science Applications Intl. CP 1134B
+>
+> Agway Inc. 1900B
+
+So we do **not** want patterns that match `####B`
+
+> Nontrading Issues - Wholly-Owned Subsidiary (non-public companies)
+>
+> Examples: 1234A
+>
+> A pseudo-ticker symbol is assigned to subsidiaries of companies with no 
+publicly traded common stock. These special tickers consist of four numbers 
+followed by an (A). For example:
+>
+> National Rural Utility Coop CP 2381A
+>
+> Tennessee Valley Authority 3015A
+
+So we do **not** want patterns that match `####A`
+
+> NYSE, ASE
+>
+> Examples: ABC.A, ABC.B
+>
+> The S&P Stock Guide lists ticker symbols for companies that trade a 
+particular class of stock on the New York Stock Exchange or American Stock 
+Exchange. These tickers are followed by a period (.), and an alpha character 
+identifying the class of stock. For example:
+>
+> American Maize Products - CL A AZE.A
+>
+> Brown-Forman - CL B BF.B
+
+It seems that a lot of different letters could be present. [According to wiki](https://en.wikipedia.org/wiki/Ticker_symbol)
+any of these could be present: 
+
+
+|                                       |                                     |                                                |
+|---------------------------------------|-------------------------------------|------------------------------------------------|
+| A – Class "A"                         | K – Nonvoting (common)              | U – Units                                      |
+| B – Class "B"                         | L – Miscellaneous                   | V – Pending issue and distribution             |
+| C – Continuance – or Nasdaq exception | M – fourth class – preferred shares | W – Warrants                                   |
+| D – New issue or reverse split        | N – third class – preferred shares  | X – Mutual fund                                |
+| E – Delinquent SEC filings            | O – second class – preferred shares | Y – American depositary receipt (ADR)          |
+| F – Foreign                           | P – first class preferred shares    | Z – Miscellaneous situations                   |
+| G – first convertible bond            | Q – In bankruptcy                   | Special codes                                  |
+| H – second convertible bond           | R – Rights                          | PK – A Pink Sheet, indicating over-the-counter |
+| I – third convertible bond            | S – Shares of beneficial interest   | SC – Nasdaq Small Cap                          |
+| J – Voting share – special            | T – With warrants or rights         | NM – Nasdaq National Market                    |
+
+<!-- Regexp to reduce the above table is \–(\s.+?)(?=\|) -->
+
+Or more compactly: 
+
+|   |   |    |
+|---|---|----|
+| A | K | U  |
+| B | L | V  |
+| C | M | W  |
+| D | N | X  |
+| E | O | Y  |
+| F | P | Z  |
+| G | Q | NM |
+| H | R | PK |
+| I | S | SC |
+| J | T |    |
+
+So we want patterns that match `XYZ.[AMEX/NYSE symbol]`
+
+> NYSE rights issue
+>
+> Examples: ABC.R
+
+TODO: So we want patterns that match `XYZ.R`
+
+> Pink Sheets/ OTC Bulletin Board
+>
+> Examples: 3ABC
+>
+> Special tickers are assigned by NASDAQ to companies trading Pink Sheets or 
+Over-the-Counter (OTC) Bulletin Board. Standard & Poor's assigns a prefix of 
+(3) to the ticker symbol. For example:
+>
+> Allstar Inns 3ALST
+>
+> Note: The number three also precedes delisted company tickers formerly traded 
+on NASDAQ.
+
+TODO: So we want patterns that match `3@@@@`
+
+> Pre-Amendment
+>
+> Examples: ABC.N, ABC.M
+>
+> Pre-amendment data is comprised of an amended company's fundamental financial 
+data prior to restatement. When a company restates one or more years of 
+fundamental financial data, Standard & Poor's represents the company's 
+pre-amendment data separately and assigns a pseudo-ticker symbol that is 
+comprised of the company's true ticker symbol and a .M or .N suffix to the 
+company's pre-amendment record.
+>
+> Networks Assoc. - Pre Amend NET.N
+
+TODO: So we do want **some** patterns that match `XYZ.N` or `XYZ.M`
+
+> Preferred Shares
+>
+> Examples: ABC.P
+> Preferred issues typically have suffixes .PA, .PB, .PC, etc. 
+(Note that structured products can also have these suffixes). Preferred issues 
+on the Toronto stock exchange can also have suffixes of .PR.A, .PR.B, .PR.C, 
+etc.
+
+TODO: So we do want **some** patterns that match `XYZ.P`, `XYZ.P@`. How does 
+this affact prefered stock on NASDAQ?
+
+> Pro Forma
+>
+> Examples: ABC.P
+>
+> When a major merger occurs for entities in the S&P 1500, a Pro Forma entity 
+is created in the database. The Pro Forma company name ends in (-pro forma) and 
+the ticker ends with a .P (first pro forma issue) or .R (second pro forma 
+issue). Standard & Poor's continues to collect data for both entities as well 
+as the "pro forma merged entity". When the transaction is completed, both the 
+non-survivor and the Pro Forma entities are inactivated.
+
+So we want patterns that match `XYZ.P`
+
+> SFAS #94
+>
+> Examples: ABC.F
+>
+> Upon introduction of SFAS #94, many companies presented both pre- and 
+post-SFAS #94 data. Standard & Poor's assigns special tickers to companies that 
+present current data that is consistent with historical data. These tickers are 
+followed by a (.F). For example:
+>
+> Ford Motor Co. (post-FASB #94) F
+>
+> Ford Motor Co. (pre-FASB #94) F.F
+
+TODO: So we do want **some** patterns that match `XYZ.F`
+
+> Structured Products
+>
+> Examples: ABC, ABC.P
+>
+> Structured Products can have suffixes .PA, .PB, .PC, etc. 
+(Note that preferred shares can also have these suffixes.)
+
+TODO: So we do want **some** patterns that match `XYZ.P`, `XYZ.P@`
+
+> "When Issued" Trading
+>
+> Examples: ABC.WI
+>
+> When a company is trading on a "when issued" basis prior to an IPO, a (.WI) 
+is appended to the ticker symbol. Once a company has gone public, the (.WI) is 
+removed from the ticker symbol.
+
+TODO: So we do want **some** patterns that match `XYZ.WI`
+
+> Wholly-Owned Subsidiary (publicly traded companies)
+> Examples: Pn
+> Wholly-owned subsidiaries are assigned pseudo-tickers. Some pseudo-tickers 
+are four-digit numbers followed by an "A" and others are parent-company's 
+ticker symbols followed by a number. All are assigned an exchange code of 5 
+(Other). The special ticker is (Pn) where P is the parent company's ticker 
+symbol and n is a unique number identifying a particular subsidiary of that 
+parent.
+>
+> Four-digit tickers followed by an "A", such as 9626A for Allstate Life 
+Insurance CO/NY, are subsidiaries of private companies. Parent company's ticker 
+symbols followed by a number, such as EGN1 for Alabama Gas Corp., are 
+subsidiaries of publicly traded companies.
+
+TODO: So we do want **some** patterns that match `XYZ1`, `XYZ2`, ...
+
+The final outcome is: 
+
+| Do want                   | May want | Do not want |
+|---------------------------|----------|-------------|
+| `XYZ`                     | `XYZ.Z`  | `XYZ.`      |
+| `XYZ#`                    | `XYZ.E`  | `XYZ._`     |
+| `XYZ.C`                   | `XYZ.D`  | `XYZ.H`     |
+| `XYZ.`                    | `XYZ.N`  | `XYZ.Z`     |
+| `XYZ.#`                   | `XYZ.M`  | `XYZ.LV`    |
+| `XYZ.EC`                  | `XYZ.F`  | `XYZ.MV`    |
+| `@@@@`                    | `XYZ.P`  | `XYZ.NV`    |
+| `@@@@[AMEX/NYSE symbol]`  | `XYZ.P@` | `XYZ.RV`    |
+| `3@@@@`                   | `XYZ.WI` | `XYZ.SV`    |
+| `3@@@@[AMEX/NYSE symbol]` |          | `XYZ.Z`     |
+| `XYZ.A`                   |          | `XYZ.U`     |
+| `XYZ.B`                   |          | `####C`     |
+| `XYZ.R`                   |          | `XYZ.H`     |
+| `XYZ.[AMEX/NYSE symbol]`  |          | `XYZ.CM`    |
+| `XYZ.N`                   |          | `####B`     |
+| `XYZ.M`                   |          | `####A`     |
+| `XYZ.P`                   |          |             |
+
+A sanity check is that all patterns we see should match one of these. Lastly, NYSE and AMEX can have 1 to 3 characters (http://deltaland.net/stocks/ticks.html)
+
+</div>
+
+```{r compu_stat_tic_first_show}
+# All firms have one symbol
+stopifnot(all(
+  with(compu_res, tapply(tic, gvkey, function(x) length(unique(x)))) == 1))
+
+# so we can work with the subset
+compu_tic <- compu_res[, .(tic = tic[1]), by = gvkey]
+
+# examples
+head(compu_tic$tic, 50)
+
+#####
+# moody
+moody_maps <- moody_res[, get_external_maps(external_maps), by = mast_issr_num]
+moody_maps <- moody_maps[
+  key == "equity ticker symbol"][, .(mast_issr_num, val)]
+
+stopifnot(
+  # we have more then one value for some issuers
+  any(
+    with(moody_maps, 
+         tapply(mast_issr_num, val, function(x) length(unique(x)))) > 1),
+  # and we have duplicates
+  anyDuplicated(moody_maps$val) > 0L)
+```
+
+<!-- Add this (?<="3|")...") instead of (?<=^3|^)...$) for NASDAQ and for the two other (?<=")...") instead of ^...$). Then paste into https://regex101.com/ -->
+
+Below, we will define regular expression to extract the trading symbol:
+
+```{r regexp_to_get_compustat_tic}
+# Make the regexp for suffixes from stocks
+stock_suffixes_regexp <- c(
+  "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", 
+  "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z")
+stock_suffixes_regexp_xtra <- c(stock_suffixes_regexp, "NM", "PK", "SC")
+
+stock_suffixes_regexp <- paste0(
+  "(", paste0(stock_suffixes_regexp, collapse = "|"), ")") 
+stock_suffixes_regexp_xtra <- paste0(
+  "(", paste0(stock_suffixes_regexp_xtra, collapse = "|"), ")") 
+
+# Make regexp for other suffixes
+other_suffixes <- c("\\d+", "\\.\\d+", "\\.C", "\\.", "\\.EC", "\\.A", "\\.B",
+                    "\\.R", "\\.N", "\\.M", "\\.P", "\\.Z", "\\.E", "\\.D", 
+                    "\\.F", "\\.P[A-z]*", "\\.WI")
+other_suffixes <- paste0("(", paste0(other_suffixes, collapse = "|"), ")") 
+```
+
+We can notice that 
+
+```{r compu_tic_props}
+stopifnot(
+  # we have at 0-2 periods
+  setequal(str_count(compu_tic$tic, "\\."), 0:2),
+  # There is no symbol with 7 or more letters
+  !any(grepl("[A-z]{6}[A-z]+", compu_tic$tic)),
+  # maximum `tic` size is 7
+  max(sapply(compu_tic$tic, nchar)) == 7L)
+```
+
+Thus, it may true that the previous suffixes can occour at most once so we 
+will use the `?` regexp symbol. There are some further cases we have to be 
+aware of. First, subsidiaries of an inactive firm can have a number followed by 
+a period. For instance
+
+```{r tic_show_period_ex}
+print_firm_stats_cu <- function(gv)
+  compu[gvkey == gv, .(
+    tic = tic[1], conm = conm[1], exchg = exchg[1], 
+    datadate_min = min(datadate), datadate_max = max(datadate)), by = gvkey]
+
+print_firm_stats_cu("005307")
+```
+
+The BOW ticker refers to an NYSE stock: 
+
+> Bowater Incorporated common stock is listed on the New York Stock Exchange (stock symbol BOW) ...
+
+Source: http://media.corporate-ir.net/media_files/nys/bow/reports/bow2002onlinear/html/shareholder.html
+
+Other examples with this pattern are:
+
+```{r show_one_more_period_ex}
+is_special_case <- grepl("\\d+\\.", compu_tic$tic)
+cbind(
+  symbol = compu_tic[is_special_case], 
+  compu[gvkey %in% compu_tic$gvkey[is_special_case], conm[1], 
+        by = gvkey])
+```
+
+The above seems to a specific case of the following. The inactive period at the 
+end seems to occour in conjunction with the other suffixes defined in 
+`other_suffixes`. Here are some other cases 
+
+```{r tic_more_general_ex}
+is_special_case <- grepl("\\..*\\.", compu_tic$tic)
+cbind(
+  symbol = compu_tic[is_special_case], 
+  compu[gvkey %in% compu_tic$gvkey[is_special_case], conm[1], 
+        by = gvkey])
+```
+
+The only thing I cannot explain in the above from the conventions previosly 
+mentioned is what two consecutive periods imply. For now, we ignore this and 
+add the possibility of an extra period at the end 
+
+```{r add_period_to_regexp}
+other_suffixes # Regexp before adding extra period rule
+other_suffixes <- paste0(other_suffixes, "?", "\\.")
+other_suffixes # Regexp after adding rule
+```
+
+```{r tic_regexp}
+# Define function to get NASDAQ securities
+get_nasdaq_sym <- function(tic, return_regexp = FALSE){
+  regex <- paste0(
+    "(?<=^3|^)[A-z]{4}", paste0(
+      "(?=", stock_suffixes_regexp, "?",  
+      other_suffixes, "?$)"))
+  
+  if(return_regexp)
+    return(regex)
+  
+  out <- rep(NA_character_, length(tic))
+  is_ok <- grepl(regex, tic, perl = T)
+  
+  if(any(is_ok))
+    out[is_ok] <- str_extract(tic[is_ok], regex)
+  
+  out
+}
+
+get_nasdaq_sym(return_regexp = TRUE)
+
+
+# Find matches and print examples
+could_be_NASDAQ <- !is.na(get_nasdaq_sym(compu_tic$tic))
+sample(compu_tic$tic[ could_be_NASDAQ], 50) # These match
+sample(compu_tic$tic[!could_be_NASDAQ], 50) # These do not
+sum(could_be_NASDAQ) # Number of potential matches
+
+# Define function to NYSE and AMEX securities
+get_other_sym <- function(tic, n_letters, return_regexp = FALSE){
+  regex <- paste0(
+    "^[A-z]{", n_letters, "}", paste0(
+      "(?=(\\.", stock_suffixes_regexp_xtra, ")?", other_suffixes, "?$)"))
+  
+  if(return_regexp)
+    return(regex)
+  
+  out <- rep(NA_character_, length(tic))
+  is_ok <- grepl(regex, tic, perl = T)
+  
+  if(any(is_ok))
+    out[is_ok] <- str_extract(tic[is_ok], regex)
+  
+  out
+}
+
+get_other_sym(n_letters = 1, return_regexp = TRUE)
+get_other_sym(n_letters = 3, return_regexp = TRUE)
+
+# Find matches and print examples
+could_be_N_n_A <- 
+  !is.na(get_other_sym(compu_tic$tic, n_letters = 1L)) | 
+  !is.na(get_other_sym(compu_tic$tic, n_letters = 2L)) | 
+  !is.na(get_other_sym(compu_tic$tic, n_letters = 3L))
+sample(compu_tic$tic[ could_be_N_n_A], 50) # These match
+sample(compu_tic$tic[!could_be_N_n_A], 50) # These do not
+sum(could_be_N_n_A) # Number of potential matches
+
+# the `n_letters` combination are not disjoint
+stopifnot(any(
+  !is.na(get_other_sym(compu_tic$tic, n_letters = 1L)) + 
+  !is.na(get_other_sym(compu_tic$tic, n_letters = 2L)) + 
+  !is.na(get_other_sym(compu_tic$tic, n_letters = 3L)) > 1L))
+
+# but the NASDAQ and other symbols are
+stopifnot(all(could_be_N_n_A != could_be_NASDAQ | !could_be_N_n_A))
+
+# Look at results of substracting with the regular expression
+tmp_indices <- which(could_be_NASDAQ)[1:25]
+cbind(
+  symb = compu_tic$tic[tmp_indices],
+  sub = get_nasdaq_sym(compu_tic$tic[tmp_indices]))
+
+tmp_indices <- which(could_be_N_n_A)[1:25]
+print(
+  cbind(
+    symb = compu_tic$tic[tmp_indices],
+    s1   = get_other_sym(compu_tic$tic[tmp_indices], n_letters = 1L),
+    s2   = get_other_sym(compu_tic$tic[tmp_indices], n_letters = 2L),
+    s3   = get_other_sym(compu_tic$tic[tmp_indices], n_letters = 3L)),
+  na.print = "", quote = FALSE)
+
+# Look at the symbols that are in neither of the two 
+not_in <- !could_be_N_n_A & !could_be_NASDAQ
+head(compu_tic$tic[not_in], 100)
+sum( not_in) # Unique symbols that is not included
+sum(!not_in) # Unique symbols that is included
+```
+
+There is one catch though with the NASDAQ symbols. Post 2007 firms from other 
+exchanges are allowed to transfer their 1-3 letter codes from other exchanges 
+(see http://www.reuters.com/article/nasdaq-tickersymbols-idUSN1035911420070710). 
+An example is TGC Industries:
+
+> While doing some research the other day, I came across tiny TGC Industries 
+(Nasdaq: TGE), which provides seismic data to oil and gas exploration 
+companies. I did a double-take when I saw that it had a three-letter ticker, 
+yet was listed on the Nasdaq (Nasdaq: NDAQ) exchange.
+
+Source: http://www.fool.com/investing/high-growth/2008/01/07/nasdaq-is-a-three-letter-word.aspx
+
+As we show below, TGC Industries have kept is symbol:
+
+```{r nasdaq_transfer_issue}
+# Find symbols starting TGE
+tmp_indices <- grepl("^TGE", compu_tic$tic)
+compu_tic$tic[tmp_indices] # Print the matching symbols
+
+# Find rows in Compustat with these symbols
+compu[
+  tic %in% compu_tic$tic[tmp_indices], .(conm[1], min(datadate)), 
+  by = .(gvkey, tic, exchg)] # `exchg` code 14 is NASDAQ
+```
+
+We make new regexp to handle these cases
+
+```{r nasdaq_transfer_issue_no_issue}
+# Define regexp for NASDAQ securities where we do require a 3
+NASDAQ_regexp_xtra <- paste0(
+  "(?<=^3)[A-z]{1,3}", paste0(
+    "(?=", stock_suffixes_regexp, "?",  
+    other_suffixes, "?$)"))
+NASDAQ_regexp_xtra # The regexp
+
+could_be_NASDAQ_xtra <- grepl(NASDAQ_regexp_xtra, compu_tic$tic, perl = T)
+
+# no need to worry about these
+stopifnot(!any(could_be_NASDAQ_xtra & !could_be_NASDAQ)) 
+```
+
+Make a `data.frame` with potential symbols
+
+```{r poten_symbols}
+compustat_syms <- compu_tic[
+  , `:=`(nasdaq_sym = get_nasdaq_sym(tic               ), 
+         other1     = get_other_sym (tic, n_letters = 1), 
+         other2     = get_other_sym (tic, n_letters = 2), 
+         other3     = get_other_sym (tic, n_letters = 3))]
+
+mo <- moody_res[, get_external_maps(external_maps), by = mast_issr_num]
+mo <- mo[key == "equity ticker symbol"][, .(mast_issr_num, mtic = val)]
+
+m1 <- merge(
+  mo, compustat_syms[
+    !is.na(nasdaq_sym)][, .(gvkey, ctic = nasdaq_sym, from = "nasdaq")],
+  by.x = "mtic", by.y = "ctic")
+m2 <- merge(
+  mo, compustat_syms[
+    !is.na(other1)    ][, .(gvkey, ctic = other1    , from = "o1"    )],
+  by.x = "mtic", by.y = "ctic")
+m3 <- merge(
+  mo, compustat_syms[
+    !is.na(other2)    ][, .(gvkey, ctic = other2    , from = "o2"    )],
+  by.x = "mtic", by.y = "ctic")
+m4 <- merge(
+  mo, compustat_syms[
+    !is.na(other3)    ][, .(gvkey, ctic = other3    , from = "o3"    )],
+  by.x = "mtic", by.y = "ctic")
+
+me <- rbind(m1, m2, m3, m4)
+nrow(me)
+```
+
+Check the result
+
+```{r check_symbol_res}
+# how many have one-to-one match?
+invisible(me[, n_moody := .N, by = mast_issr_num][
+  , n_compu := .N, by = gvkey])
+sum(me[, n_moody == 1L & n_compu == 1L])
+
+# do the names seem to be plausible? 
+me <- merge(me, moody[, .(issuer_nam = issuer_nam[1L]), by = .(mast_issr_num)], 
+            by = "mast_issr_num")
+me <- merge(me, compu[, .(conm = conm[1L], exchg = exchg[1L]), by = gvkey], 
+            by = "gvkey")
+head(me[n_moody == 1L & n_compu == 1L], n = 20)
+
+# save file to check through 
+write.csv(me[n_moody == 1L & n_compu == 1L], file = 
+            file.path("temp", "tic_matches.csv"), row.names = FALSE)
+```
+
+Make list of those we include from the first pass
+
+<div class="hideable">
+
+```{r first_pass_tic}
+keep <- matrix(
+  as.integer(c(
+      1072,  11951,
+      1166,  19190,
+      1382,  19856,
+      1526,  26385,
+      1594,   7242,
+      1976,   7376,
+      2322,  22301,
+      2698,  26956,
+      2901,    655,
+      3144,  11737,
+      3221,  51147,
+      3570,  30032,
+      3851,  28828,
+      3938,  22475,
+      4025,  12765,
+      4191,  12746,
+      4204,   4088,
+      4523,  20048,
+      4641,  16822,
+      4675,   9949,
+      4692,  19156,
+      4790,   4185,
+      4864,  16474,
+      4926,  13104,
+      5063,   2883,
+      5125,  11268,
+      5161,   6738,
+      5180,  20617,
+      5250,  53256,
+      5417,  26091,
+      5572,   4705,
+      5671,  20534,
+      5709,   5917,
+      5775,  17134, 
+      5826,  18467,
+      5885,  27402,
+      6171,  27800,
+      6216,   8682,
+      6268,  28024,
+      6333,  11069,
+      6512,  25312,
+      6547,  29558,
+      6635,   3185,
+      6765,  29366,
+      6768,  28570,
+      6908,  31858,
+      7116,   1184,
+      7186,   4235,
+      7228,  17705,
+      7260,   2156, 
+      7368,  26067,
+      7637,   2329,
+      7665,  30316,
+      7773,  31353,
+      7815,   3470,
+      7917,  11600,
+      7936,  14139,
+      8020,   4720,
+      8150,  14526, 
+      8252,  14214,
+      8463,  13013,
+      8544,  24991,
+      8594,  28057,
+      8599,   4201,
+      8804,  30191,
+      8853,  26005,
+      8867,  30629,
+      9183,  31753,
+      9258,  30427,
+      9556,  12452,
+     10004,   5553,
+     10008,  18752,
+     10329,   6815,
+     10565,   7816,
+     10757,  21787,
+     10845,  11094,
+     10888,   5588,
+     11012,  20110,
+     11115,  20845,
+     11347,  13337,
+     11396,  23534,
+     11463,  24362,
+     11482,  16533,
+     11503,  14062,
+     11584,   2159,
+     11620,   5288,
+     11644,   5769,
+     11649,  19541,
+     11823,   3294,
+     12074,  17138,
+     12090,    720,
+     12151,  55548,
+     12233,      3,
+     12246,  15881,
+     12350,    676,
+     12413,  51498,
+     12648,   7569,
+     12668,  29787,
+     13285,  18735,
+     13405,  29601,
+     13477,  18835,
+     13870,  10251, 
+     14049,   9718,
+     14100,  14169, 
+     14152,  20786,
+     14380,  21831,
+     14466,   7612,
+     14503,  21240,
+     14835,   5650,
+     14871,   5231,
+     14890,  24888,
+     15172,  54339,
+     15208,  21640,
+     15307,   6735,
+     16420,  22403,
+     16932,  18710,
+     17243,   7580,
+     17947,  49175,
+     18438,    840,
+     18675,  52937,
+     18792,  52921,
+     18842,  47736,
+     19175,  52917,
+     19190,  53056,
+     20115,   4833,
+     20192,   7822,
+     20423,  12132,
+     21487,  26626,
+     21868,  18107,
+     22794,   2454,
+     23466,  14949,
+     23583,   4449,
+     23697,   7209,
+     24032,   4486,
+     24096,  17173,
+     24222,  14738,
+     24302,  50231,
+     24363,  12596,
+     24468,   2455,
+     24483,   3911,
+     24934,  12845,
+     25480,    212,
+     25682,  13021,
+     25749,  29226,
+     25879,   6577,
+     25922,  13798,
+     25983,  15824,
+     25991,  13038,
+     26004,  27214,
+     26011,  14483,
+     26022,   2480,
+     27517,   5679,
+     27914,   7266,
+     27957,   8238,
+     28191,  12157,
+     28338,  29854,
+     28342,   6502,
+     28380,  24748,
+     28449,  17034,
+     28624,   2726,
+     28669,   4433,
+     28726,   7930,
+     28877,  49447,
+     28904,  16153, 
+     28935,  28046,
+     29250,    446,
+     29286,  16012,
+     29710,   2166,
+     29804,  51579,
+     29899,  10669,
+     30259,  22611,
+     30443,  22662,
+     30626,  21758,
+     30778,  20079,
+     31600,  16924,
+     31692,  31143,
+     60800,   7559,
+     60904,   5370,
+     61214,  11403,
+     61263,   7169,
+     61302,  22190,
+     61552,  30098,
+     61572,    209,
+     61798,  22253,
+     61859,  20628,
+     61986,  10572,
+     62036,   2601,
+     62330,  28423,
+     62471,  31029,
+     62572,  18091,
+     62756,  29562,
+     62855,  25905,
+     62898,  18703,
+     62965,   8013,
+     63329,  10431,
+     63422,  30545,
+     63643,  53898,
+     63791,  30357,
+     63907,  16584,
+     63914,   8600,
+     64341,  51253,
+     64510,  19397, 
+     64602,  23031,
+     64690,  10681,
+     64896,  10540,
+     65142,  15353,
+     65275,  23891,
+     65350,  22283,
+     65459,   3049,
+     65972,  13109,
+     66265,  11057,
+     66673,  23869,
+     66684,  31007,
+     66716,  29772, 
+    100477,  23288,
+    100873,  49746,
+    101352,  18759,
+    103487,  54156,
+    106881,  22990,
+    110326,  14158,
+    110685,  25692,
+    110732,  30039,
+    111491,  16984,
+    111839,  15257,
+    111880,  20252,
+    113033,   6516,
+    113362,  54617,
+    113439,  28072,
+    116773,   7800,
+    119477,  30435,
+    119753,   4262,
+    120835,   3165,
+    122436,  31108,
+    123016,   8748,
+    124321,   5520,
+    124638,  15006,
+    126615,  50935,
+    126721,  24002,
+    129418,  22871,
+    130305,  48930,
+    133367,  50160,
+    133432,  52420,
+    133767,   3420,
+    137064,   5237,
+    137137,   6388,
+    137433,  30760,
+    137874,  31654,
+    140756,  51717,
+    140821,   1393,
+    140905,  24200,
+    142540,   3770,
+    143605,  27366,
+    144009,  25087,
+    144396,  14344,
+    144535,    302,
+    145911,  12764,
+    145933,  11358,
+    146613,  17444,
+    146617,  11472,
+    146714,   5150,
+    147202,  21591,
+    147391,   1101,
+    147449,   5496,
+    148281,  15704,
+    148476,  30048,
+    148650,  13803,
+    148932,   4951,
+    150306,  51475,
+    152249,  29177,
+    153130,  12490, 
+    157118,   8551,
+    157353,   1778,
+    157859,  14674,
+    158736,  52558,
+    160181,  31270,
+    160272,  52328,
+    160632,  31435,
+    160670,  22517,
+    160785,  27384,
+    161075,  24976,
+    161994,  14232,
+    162127,   6982,
+    162336,   6366,
+    162559,   2633,
+    163113,  10150,
+    163772,  29872,
+    163877,  54208,
+    163879,  23452,
+    164002,  30495,
+    164408,  26906,
+    164533,   9327,
+    164758,   3754,
+    165123,  28475,
+    166230,   8315,
+    170418,  51502,
+    170960,  12876,
+    174317,  54913,
+    174531,  21605,
+    175092,  26043,
+    175110,  48976,
+    175688,  15248,
+    175689,  30029,
+    176523,  26258, 
+    177953,  22692,
+    178327,  53219,
+    178453,  52050,
+    179437,  10042,
+    180402,  16768,
+    184725,  54374,
+    185277,  48925,
+    185517,  28143,
+    186590,  52432,
+    186785,  50323,
+    210418,  22762,
+    211732,  15292,
+    220762,  15684,
+    221612,  12737,
+    223911,   6403,
+    259503,  10755,
+    260751,  10597,
+    264397,   4131,
+    268208,  21532,
+    282189,  48496,
+    293884,  48261) + 1e-8), ncol = 2, byrow = TRUE, 
+  dimnames = list(NULL, c("gvkey", "mast_issr_num")))
+keep <- data.table(keep)[, gvkey := sprintf("%06d", gvkey)]
+
+tmp <- merge(me[, .(gvkey, mast_issr_num, is_me = TRUE)], 
+             keep, all.y = TRUE, by = c("gvkey", "mast_issr_num"))
+
+# these where not found
+tmp[is.na(is_me)]
+
+# number of matches
+nrow(tmp[!is.na(is_me)])
+
+# save file to check again
+write.csv(
+  merge(me, keep, by = c("gvkey", "mast_issr_num")), 
+  file = file.path("temp", "tic_matches_keep.csv"), row.names = FALSE)
+```
+
+</div>
+
+Make the list for the matches and update the list of remaining firms in either 
+dataset
+
+```{r update_after_tick}
+# make `data.frame` with tic matches
+tic_matches <- merge(
+  me[, .(gvkey, mast_issr_num)], keep, by = c("gvkey", "mast_issr_num")) 
+
+# update the left over firms
+moody_res <- moody_res[!mast_issr_num %in% tic_matches$mast_issr_num]
+compu_res <- compu_res[!gvkey %in% tic_matches$gvkey]
+
+# update potential matches
+potential_matches <- potential_matches[, .(gvkey, mast_issr_num)]
+potential_matches <- potential_matches[
+  !gvkey %in% tic_matches$gvkey & 
+    !mast_issr_num %in% tic_matches$mast_issr_num ]
+nrow(potential_matches)
+
+# add the new ones
+potential_matches$source <- "cusip"
+keep$is_keep <- TRUE
+me_potent <-  merge(me, keep, by = c("gvkey", "mast_issr_num"), all.x = TRUE)
+me_potent <- me_potent[is.na(is_keep)]
+me_potent <- me_potent[, .(gvkey, mast_issr_num, source = "tic")]
+potential_matches <- rbind(potential_matches, me_potent)
+nrow(potential_matches)
+
+# we have some that match by both 
+tmp <- potential_matches[, .N, by = .(gvkey, mast_issr_num)]$N
+max(tmp)
+sum(tmp == 2L)
+```
+
+## Fuzzy matching of company names
+
+We try to match by the firm name. 
+
+```{r check_n_make_name_data_frame}
+# Moody company names are static
+stopifnot(all(
+  moody_res[, length(unique(issuer_nam)), by = mast_issr_num]$V1 == 1L))
+moody_name <- moody_res[
+  , .(issuer_nam = tolower(issuer_nam)), by = mast_issr_num]
+nrow(moody_name)
+
+# names are not unqiue to the issuer
+local({
+  tmp <- moody_name[
+    , .(mast_issr_num = unique(mast_issr_num)), by = issuer_nam][
+      , count := .N, by = issuer_nam]
+  stopifnot(any(tmp$count > 1)) # the claim above
+  cat("Table of ", sQuote("mast_issr_num"), "s number of unqiue names\n", 
+      sep = "")
+  print(table(tmp[, first(count), by = issuer_nam]$V1))
+  
+  cat("Some random names with duplicate", sQuote("mast_issr_num"), "\n")  
+  tmp <- tmp[count > 1L][, .(count = first(count)), by = issuer_nam]
+  print(tmp[sample.int(nrow(tmp), min(10, nrow(tmp)))])
+})
+
+# Compustat company names are static
+stopifnot(all(
+  compu_res[, length(unique(conm)), by = gvkey]$V1 == 1L))
+compu_name <- compu_res[, .(conm = tolower(conm[1])), by = gvkey]
+nrow(compu_name)
+
+# we also have some duplicates here
+local({
+  tmp <- compu_name[
+    , .(gvkey_num = unique(gvkey)), by = conm][
+      , count := .N, by = conm]
+  stopifnot(any(tmp$count > 1)) # the claim above
+  cat("Table of ", sQuote("gvkey"), "s number of unqiue names\n", 
+      sep = "")
+  print(table(tmp[, first(count), by = conm]$V1))
+  
+  cat("Some random names with duplicate", sQuote("gvkey"), "\n")  
+  tmp <- tmp[count > 1L][, .(count = first(count)), by = conm]
+  print(tmp[sample.int(nrow(tmp), min(10, nrow(tmp)))])
+})
+```
+
+Deal with many ways of writing the same
+
+<div class="hideable">
+
+```{r clean_names}
+#####
+# deal with corporation
+func <- function(regex, x, replacement, f = str_replace){
+  tmp <- grepl(regex, x, perl = TRUE)
+  if(!any(tmp)){
+    cat("No matches\n")
+    return(x)
+  }
+  
+  cat("There are", sum(tmp), "matches. Here is", sQuote("head()"), "before\n")
+  print(head(x[tmp], 6))
+  
+  cat("\nHere is", sQuote("head()"), "after\n")
+  print(f(head(x[tmp], 6), regex, replacement))
+  
+  f(x, regex, replacement)
+}
+
+regex <- "(\\ corp)([^\\ -]+)((\\ .+)|$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam, "\\1\\3")
+
+compu_name$conm_use <- 
+  func(regex, compu_name$conm, "\\1\\3")
+
+# we also have some cos 
+regex <- "(?<=\\ )co\\."
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "corp")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "corp")
+
+# deal with co w/o period
+regex <- "(?<=\\ )co(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "corp")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "corp")
+
+# deal with cp
+regex <- "(?<=\\ )cp(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "corp")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "corp")
+
+# deal with company
+regex <- "(?<=\\ )company(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "corp")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "corp")
+
+#####
+# deal with amer
+regex <- "(?<=\\ )amer(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "america")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "america")
+
+#####
+# deal with incorporation
+regex <- "(\\ inc)(orpo[A-z]+|\\.)(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "\\ inc")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "\\ inc")
+
+#####
+# deal with limited
+regex <- "(?<=\\ )limited(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "ltd")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "ltd")
+
+#####
+# deal with plc
+regex <- "(?<=\\ )plc(?=\\ |$)"
+
+# amount of matches differ a lot
+mean(grepl(regex, moody_name$issuer_nam, perl = TRUE))
+mean(grepl(regex, compu_name$conm_use  , perl = TRUE))
+
+# why should there be more plcs in Moodys than in Compustat? May be as Moody's
+# is global...
+
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "llc")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "llc")
+
+#####
+# deal with US
+regex <- "(?<=\\ |^)u\\.s\\.(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "us")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "us")
+
+regex <- "(?<=\\ |^)u\\ s\\ a(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "us")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "us")
+
+regex <- "(?<=\\ |^)u\\ s(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "us")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "us")
+
+#####
+# deal with international
+regex <- "(?<=\\ |^)intl(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "international")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "international")
+
+#####
+# deal with group
+regex <- "(?<=\\ |^)grp(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "group")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "group")
+
+#####
+# deal with services
+regex <- "(?<=\\ |^)svcs(?=\\ |$)"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "services")
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "services")
+
+##### 
+# remove periods
+
+# many in Moody's but not compustat
+sum(grepl(".", moody_name$issuer_nam_use, fixed = TRUE))
+sum(grepl(".", compu_name$conm_use, fixed = TRUE))
+
+regex <- "\\."
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "", f = str_replace_all)
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "", f = str_replace_all)
+
+##### 
+# remove commas
+# many in Moody's but not compustat
+sum(grepl(",", moody_name$issuer_nam_use, fixed = TRUE))
+sum(grepl(",", compu_name$conm_use, fixed = TRUE))
+
+regex <- ","
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "", f = str_replace_all)
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "", f = str_replace_all)
+
+#####
+# remove dash
+# many in Moody's but not compustat
+sum(grepl("-", moody_name$issuer_nam_use, fixed = TRUE))
+sum(grepl("-", compu_name$conm_use, fixed = TRUE))
+
+regex <- "-"
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "\\ ", f = str_replace_all)
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "\\ ", f = str_replace_all)
+
+#####
+# remove parentheses
+regex <- "\\(|\\)"
+
+moody_name$issuer_nam_use <-
+  func(regex, moody_name$issuer_nam_use, "", f = str_replace_all)
+compu_name$conm_use <- 
+  func(regex, compu_name$conm_use      , "", f = str_replace_all)
+```
+
+```{r check_rebuild_two, include = FALSE}
+tmp <- list(moody_name, compu_name)
+.check_sum_lv <- file.path("data", "lv_dist_check")
+if(!file.exists(.check_sum_lv)){
+  knitr::opts_chunk$set(cache.rebuild = TRUE)
+} else
+  knitr::opts_chunk$set(
+    cache.rebuild = knitr::opts_chunk$get("cache.rebuild") ||
+      !readRDS(.check_sum_lv) == digest::digest(tmp))
+
+saveRDS(digest::digest(tmp), .check_sum_lv)
+```
+
+</div>
+
+Compute Levenshtein distance and check matches
+
+<!--
+  knitr::opts_knit$set(output.dir = ".")
+  knitr::load_cache("lv_dist", path = paste0(
+     file.path("markdown", "cache", "mapping"), .Platform$file.sep))
+-->
+
+```{r lv_dist, cache = 1}
+# compute Levenshtein distance and keep the lowest if it is below a given 
+# threshold. It is quite anoying that we cannot pass a max value as in `agrep`.
+# It could make the code run much faster...
+func <- function(nam){
+  require(stringdist)
+  x <- stringdist(nam, compu_name$conm_use, method = "lv")
+  keep <- which(x == min(x) & x <= 4L)
+  if(length(keep) < 1)
+    return(list(conm_use = NA_character_, conm = NA_character_,
+                gvkey = NA_character_, min_dist = NA_real_))
+  
+  list(conm_use = compu_name$conm_use[keep], conm = compu_name$conm[keep], 
+       gvkey = compu_name$gvkey[keep], 
+       min_dist = rep(x[which.min(x)], length(keep)))
+}
+
+moody_name <- moody_name[
+  , c(func(issuer_nam_use), .(
+    issuer_nam = first(issuer_nam)), issuer_nam_use = first(issuer_nam_use)), 
+  by = mast_issr_num]
+
+# remove those without matches
+moody_name <- moody_name[!is.na(conm)]
+```
+
+Check result
+
+```{r lv_dist_check}
+nrow(moody_name) # number of matches
+
+# those with no distance
+exact_name_matches <- moody_name[min_dist < 1L]
+nrow(exact_name_matches)
+
+# deal with duplicates
+invisible(exact_name_matches[, is_dup := .N > 1L, by = mast_issr_num][
+  , is_dup := .N > 1L | is_dup, by = gvkey])
+exact_name_matches[is_dup == TRUE][order(conm)]
+
+# we ignore these
+exact_name_matches <- exact_name_matches[is_dup == FALSE]
+nrow(exact_name_matches)
+```
+
+Add the ones with exact matches
+
+```{r add_exact_name}
+name_matches <- exact_name_matches[, .(gvkey, mast_issr_num)]
+
+# remove these from the other `data.frames`
+moody_name <- moody_name[
+  !gvkey %in% name_matches$gvkey & 
+    !mast_issr_num %in% name_matches$mast_issr_num] 
+nrow(moody_name)
+
+potential_matches <- potential_matches[
+  !gvkey %in% name_matches$gvkey & 
+    !mast_issr_num %in% name_matches$mast_issr_num]
+```
+
+Add the remaining to the potential matches
+
+```{r add_names_to_potential}
+potential_matches <- rbind(
+  potential_matches, moody_name[, .(gvkey, mast_issr_num, source = "name")])
+```
+
+Check those with many matches from different sources
+
+```{r set_potential_matches_final}
+potential_matches_final <- 
+  potential_matches[, n_macthes := .N, by = .(mast_issr_num, gvkey)][
+    , .(n_macthes = first(n_macthes), 
+        sources = paste0(source, collapse = ";")), 
+    by = .(mast_issr_num, gvkey)]
+
+# add additional information
+potential_matches_final <- merge(
+  potential_matches_final, 
+  compu[, .(conm = first(conm), tic = first(tic)), by = gvkey], by = "gvkey")
+
+moody_maps <- moody[, get_external_maps(external_maps), by = mast_issr_num]
+moody_maps <- moody_maps[
+  key == "equity ticker symbol"][, .(mast_issr_num, mtic = val)]
+potential_matches_final <- merge(
+  potential_matches_final, moody_maps, by = "mast_issr_num")
+
+potential_matches_final <- merge(
+  potential_matches_final, 
+  moody[, .(mast_issr_num, issuer_nam)], by = "mast_issr_num")
+  
+# sort and write to file
+setorder(potential_matches_final, -n_macthes)
+write.csv(potential_matches_final, 
+          file.path("temp", "potential_matches_final.csv"))
+```
+
+We add some with two or more matches
+
+<div class="hideable">
+
+```{r add_tic_name_match}
+comp_matches <- potential_matches_final[n_macthes > 1L][
+  , .(gvkey, mast_issr_num)]
+nrow(comp_matches)
+
+# do they seem to match?
+local({
+  tmp <- merge(comp_matches, compu[
+    , .(tic_comp = first(tic), cusip_comp = first(cusip), conm = first(conm)), 
+    by = gvkey])
+  tmp <- merge(tmp, moody[, .(mast_issr_num, external_maps, issuer_nam)], 
+               by = "mast_issr_num")
+  
+  for(i in 1:min(5, nrow(tmp))){
+    cat(sprintf("Firm % 4d:", i), "\n----------\n")
+    print(tmp[i , .(tic_comp, cusip_comp)])
+    cat(tmp[i, external_maps], "\n")
+    print(tmp[i , .(conm, issuer_nam)])
+    cat("\n")
+  }
+})
+
+# list of those we exclude. This may need to be updated in the future. 
+excl <- matrix(
+  as.integer(c(
+    162907,    19, 
+     30198,  4736,
+      8810,  8838,
+     25282, 11900,
+      2176, 14368,
+     11359, 15374,
+     11672, 20633,
+     13504, 20633,
+    120178, 29751,
+     61464, 31393,
+     20185, 31692) + 1e-4), ncol = 2, byrow = TRUE, 
+  dimnames = list(NULL, c("gvkey", "mast_issr_num")))
+excl <- data.table(excl)[, gvkey := sprintf("%06d", gvkey)]
+comp_matches$is_comp <- TRUE
+excl$is_excl <- TRUE
+comp_matches <- merge(
+  comp_matches, excl, by = c("gvkey", "mast_issr_num"), all.x = TRUE)
+cat("There are", 
+    sum(!is.na(comp_matches$is_excl) & is.na(comp_matches$is_comp)), 
+    "that are not found\n")
+
+# these will be excluded
+comp_matches[!is.na(is_excl)]
+comp_matches <- comp_matches[is.na(is_excl)]
+invisible(comp_matches[, `:=`(is_excl = NULL, is_comp = NULL)])
+nrow(comp_matches)
+
+# drop duplicates
+comp_matches[, keep := .N < 2L, by = gvkey][
+  , keep := keep & .N < 2L, by = mast_issr_num]
+comp_matches <- comp_matches[keep == TRUE]
+nrow(comp_matches)
+```
+
+</div>
+
+## Stack, check, and save table with mappings
+
+```{r stack}
+# stack
+final <- rbind(
+  tic_matches     [, .(gvkey, mast_issr_num)], 
+  cusip_match     [, .(gvkey, mast_issr_num)],
+  name_matches    [, .(gvkey, mast_issr_num)],
+  comp_matches[, .(gvkey, mast_issr_num)]) 
+
+# check that we do not have any duplicates
+stopifnot(
+  !anyDuplicated(final$gvkey), !anyDuplicated(final$mast_issr_num))
+nrow(final)
+
+# save table
+saveRDS(final, file.path("data", "moody-compu-link.RDS"))
+```

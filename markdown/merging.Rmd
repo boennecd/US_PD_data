@@ -1,0 +1,1562 @@
+---
+title: "Merging"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:  
+  html_document:
+    toc: true
+bibliography: refs.bib
+---
+
+<script>
+$(document).ready(function(){
+  var hide_divs = $("div.hideable");
+  hide_divs.each(function(){
+    // Wrap content in div
+    $(this).wrapInner( "<div class='hideable_content', style='display: none;'></div>");
+    
+    // Add button
+    $(this).prepend("<button id='toogle'>show</button>");
+  });
+  
+  // Add hideable btn
+  // Put the rest in a div
+  
+  $("div.hideable button#toogle").click(function(){
+    var parent = $(this).parent();
+    var target_div = $(parent).find("div.hideable_content");
+    
+    if(target_div.css("display") == "none"){
+      target_div.show();
+        $(this).text("Hide");
+    } else {
+      target_div.hide();
+      $(this).text("Show");
+    }
+  });
+});
+</script>
+
+## Load data
+
+```{r static_setup, include=FALSE, cache=FALSE}
+# please do not set options here that could change...
+knitr::opts_chunk$set(
+  cache.path = 
+    paste0(file.path("cache", "merging"), .Platform$file.sep), 
+  fig.path = 
+    paste0(file.path("fig"  , "merging"), .Platform$file.sep))
+```
+
+```{r def_data_files}
+# assign file names
+fs <- list(
+  DtD          = file.path("data", "distance-to-default.RDS"), 
+  m_data       = file.path("data", "market-datat.RDS"),
+  compu        = file.path("data", "compustat.RDS"),
+  moody        = file.path("data", "moody-events.RDS"),
+  moody_issuer = file.path("data", "moody-issuer.RDS"), 
+  monthly      = file.path("data", "CRSP", "monthly_stacked.RDS"),
+  map_file     = file.path("data", "moody-compu-link.RDS"),
+  tress        = file.path("data", "tress_bill.RDS"), 
+  idx          = file.path("data", "index.RDS"), 
+  ym_R         = file.path("R", "ym.R"), 
+  delist       = file.path("data", "CRSP", "delist.RDS"))
+```
+
+```{r check_rebuild, echo = FALSE, cache = TRUE, cache.extra = tools::md5sum(unlist(fs))}
+# see https://stackoverflow.com/a/52163751/5861244
+knitr::opts_chunk$set(cache.rebuild = TRUE)
+```
+
+```{r setup, include=FALSE, cache=FALSE}
+# please do set options here that could change...
+knitr::opts_chunk$set(
+  echo = TRUE, fig.height = 4, fig.width = 7, dpi = 128, comment = "#R", 
+  error = FALSE)
+options(digits = 4, scipen = 10, width = 70)
+```
+
+Source script to get year-month variable
+
+```{r source_ym}
+source(fs$ym_R)
+```
+
+Load data
+
+```{r load_dat}
+DtD          <- readRDS(fs$DtD)
+market       <- readRDS(fs$m_data)
+link         <- readRDS(fs$map_file)
+compu        <- readRDS(fs$compu)$data
+moody        <- readRDS(fs$moody)
+moody_issuer <- readRDS(fs$moody_issuer)
+mth          <- readRDS(fs$monthly)
+idx_dat      <- readRDS(fs$idx)
+tress        <- readRDS(fs$tress)
+```
+
+We add the delisting information to `market` table
+
+```{r add_delist}
+delist <- readRDS(fs$delist)$data
+
+# some are not in the delisting table as they have not been delisted
+stopifnot(any(market$permno %in% delist$permno))
+
+# we will set the rows without a delisting date to have delisting date of today
+market <- merge(
+  market, 
+  with(delist, data.frame(permno, dlstdt, dlstcd, first_ret, is_delist = TRUE)),
+  all.x = TRUE, by = "permno")
+
+market <- within(market, {
+  dlstdt[is.na(is_delist)] <- Sys.Date()
+  is_delist <- NULL
+})
+
+stopifnot(!anyNA(market$dlstdt))
+
+rm(delist)
+```
+
+
+Make a few checks
+
+```{r check}
+stopifnot(all(link$gvkey %in% unique(compu$gvkey)))
+stopifnot(all(link$gvkey %in% unique(market$gvkey)))
+stopifnot(all(link$gvkey %in% unique(mth$gvkey)))
+
+library(data.table)
+link <- data.table(link)
+stopifnot(
+  # link between Compustat and Moody is one-to-one
+  all(link[, .N, by = gvkey]$N == 1),
+  all(link[, .N, by = mast_issr_num]$N == 1))
+
+market <- data.table(market)
+stopifnot(
+  # link between Compustat and CRSP is many-to-many
+  any(market[, length(unique(permno)), by = gvkey ]$V1 > 1), 
+  any(market[, length(unique(gvkey )), by = permno]$V1 > 1), 
+  
+  # but unique at each time point
+  all(market[, length(unique(permno)), by = .(gvkey , ym)]$V1 == 1),
+  all(market[, length(unique(gvkey )), by = .(permno, ym)]$V1 == 1))
+```
+
+## Monthly data
+We load in the monthly data only for the SIC codes from CRSP
+
+```{r setup_monthly}
+mth <- data.table(mth)
+mth <- mth[, .(ym = make_ym(date), hsiccd, siccd, gvkey)]
+
+stopifnot(
+  # both vary but the former is the the "header" and should be the "current". 
+  # However, this is on a `permno` basis and not `gvkey`
+  any(mth[, length(unique(hsiccd)) > 1L, by = gvkey]$V1),
+  # is static
+  any(mth[, length(unique( siccd)) > 1L, by = gvkey]$V1))
+```
+
+Do notice that `hsiccd`
+
+> ... will be zero for companies where CRSP's data source did not provide SIC 
+Codes.
+
+So we set the zero values to `NA`
+
+```{r monthly_set_nas}
+mth[hsiccd == 0, hsiccd := NA_real_][siccd == 0, siccd := NA_real_]
+```
+
+Check number of firms by month
+
+<div class="hideable">
+
+```{r crsp_firm_per_m, cache = 1}
+local({
+  stopifnot(all(unlist(tapply(mth$ym, mth$gvkey, anyDuplicated)) == 0))
+  tmp <- table(make_ym_inv(mth$ym))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms", ylim = range(c(0, tmp)))
+})
+```
+
+</div>
+
+## Compustat
+We prepare the Compustat data. First, we only keep the data we need
+
+```{r drop_compu}
+compu <- data.table(compu)
+compu <- compu[gvkey %in% link$gvkey]
+```
+
+Insert the most recent annual figures when the quarterly figures are missing and 
+also annualize the flow variables.
+
+<div class="hideable">
+
+```{r deal_w_missing_n_flow}
+#####
+# annualize flows
+flows <- c("saleq", "niq", "oiadpq")
+
+# mean berfore
+sapply(compu[, flows, with = FALSE], mean, na.rm = TRUE)
+sapply(compu[, gsub("(.+)(q)$", "\\1", flows), with = FALSE], 
+       mean, na.rm = TRUE)
+
+invisible(compu[, (flows) := lapply(.SD, `*`, y = 4), .SD = flows])
+sapply(compu[, flows, with = FALSE], mean, na.rm = TRUE)
+
+#####
+# insert annual figures when variables are missing
+figs <- c("wcap", "at", "re", "oiadp", "sale", "ni", "lt", "lct", "act", 
+          "dlc", "dltt", "che", "rect", "seq", "txditc", "txdb", "pstk", 
+          "mib", "ceq")
+figsq <- paste0(figs, "q")
+
+stopifnot(all(figs  %in% colnames(compu)), !anyDuplicated(figs),
+          all(figsq %in% colnames(compu)))
+invisible(compu[, ym := make_ym(datadate)])
+setkey(compu, gvkey, ym) # sort data
+
+# define function to impute
+func <- function(x, y, ti){
+  is_na <- which(is.na(x))
+  if(length(is_na) > 0)
+    x[is_na] <- y[is_na]
+  x
+}
+
+# print means before imputation. Do the same after to check diff
+compu[, rbind(mean      = sapply(.SD, mean, na.rm = TRUE), 
+              `frac na` = sapply(.SD, function(x) mean(is.na(x)))),
+      .SD = figsq]
+
+for(i in seq_along(figs))
+  compu[, (figsq[i]) := func(.SD[[figsq[i]]], .SD[[figs[i]]], ym), by = gvkey]
+
+compu[, rbind(mean      = sapply(.SD, mean, na.rm = TRUE), 
+              `frac na` = sapply(.SD, function(x) mean(is.na(x)))),
+      .SD = figsq]
+
+#####
+# compute book value of equity as in 
+#   https://wrds-www.wharton.upenn.edu/pages/support/applications/risk-and-valuation-measures/market-book-mb-ratio/#mb-ratio-introduction-and-background-information
+compu[, ps := pstkrv][
+  is.na(ps), ps := pstkl][
+    is.na(ps), ps := pstkq][
+      is.na(ps), ps := 0.]
+mean(compu$ps == 0)
+
+compu[, she := seqq]
+mean(is.na(compu$she))
+compu[is.na(she), she := ceqq + pstkq]
+mean(is.na(compu$she))
+compu[is.na(she), she := atq - ltq - mibq]
+
+mean(compu$she <= 0, na.rm = TRUE) # notice: quite a few negative values
+
+compu[, be := she - ps]
+mean(compu$be < 0, na.rm = TRUE)
+quantile(compu$be, probs = seq(0, 1, by = .05), na.rm = TRUE)
+```
+
+</div>
+
+Check number of firms by month (some months are sparse likely due to quarterly 
+reporting)
+
+<div class="hideable">
+
+```{r compu_n_firms, cache = 1}
+local({
+  tmp <- table(make_ym_inv(compu$ym))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+})
+```
+
+</div>
+
+
+## Macro data
+
+We prepare the macro data that we will add. We start with the stock return
+
+```{r prep_stock}
+str(idx_dat)
+colnames(idx_dat)[colnames(idx_dat) %in% c("caldt", "vwretd")] <- 
+  c("date", "vwret")
+
+# compute one year return 
+idx_dat <- data.table(idx_dat)
+idx_dat[, ym := make_ym(date)]
+setkey(idx_dat, ym) # sort
+
+# compute one year log stock return
+idx_dat[
+  , log_market_ret :=
+    idx_dat[.BY$ym - 12L < ym & ym <= .BY$ym, 
+          if(length(unique(ym)) < 11L) NA_real_ else sum(log1p(vwret))], 
+  by = ym]
+idx_dat <- idx_dat[, is_last := 1:.N == .N, by = ym][is_last == TRUE]
+
+# we have one observation for each month
+stopifnot(all(idx_dat$ym[-1] - head(idx_dat$ym, -1) == 1L))
+
+# plot series
+plot(make_ym_inv(idx_dat$ym), idx_dat$log_market_ret, type = "l")
+abline(h = 0, lty = 2)
+
+macro_dat <- idx_dat[, .(ym, log_market_ret)]
+```
+
+Then we add the 1-Year Treasury Constant Maturity Rate
+
+```{r add_tress}
+str(tress)
+tress$ym <- make_ym(tress$date)
+
+# there are some NAs 
+stopifnot(anyNA(tress$r1y))
+
+# use carry forward
+for(i in 2:nrow(tress))
+  if(is.na(tress$r1y[i]))
+    tress$r1y[i] <- tress$r1y[i - 1L]
+
+# keep only the last row each month
+tress <- data.table(tress)
+tress[, is_last := 1:.N == .N, by = ym]
+tress <- tress[is_last == TRUE][, is_last := NULL]
+
+# plot
+with(tress, plot(r1y ~ make_ym_inv(ym), type = "l"))
+
+# merge
+macro_dat <- merge(macro_dat, tress, by = "ym", all.x = TRUE)
+
+# we dont have any NAs
+macro_dat <- subset(macro_dat, date > as.Date("1970-01-01"))
+stopifnot(!anyNA(macro_dat$log_market_ret), !anyNA(macro_dat$r1y))
+```
+
+## Check number of firms in other data sets
+
+<div class="hideable">
+
+```{r check_n_firms_other, cache = 1}
+local({
+  tmp <- table(make_ym_inv(as.integer(DtD$ym + sign(DtD$ym) * 1e-8)))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms", ylim = range(tmp, 0))
+  
+  # default events 
+  defs <- subset(moody, 
+                 status == "default" & 
+                   make_ym(status_start) > make_ym(as.Date("1979-12-31")))
+  tmp <- make_ym_inv(make_ym(defs$status_start))
+  tmp <- table(tmp)
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+  
+  # non default transitions 
+  non_defs <- subset(
+    moody, 
+    status != "default" & make_ym(status_start) > 
+      make_ym(as.Date("1979-12-31")))
+  tmp <- make_ym_inv(make_ym(non_defs$status_start))
+  tmp <- table(tmp)
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+})
+```
+
+</div>
+
+## Merging
+All the operations we will do is going to use the `gvkey` from 
+Compustat as an entity. Further, we will use `tmerge` from the `survival` 
+package to setup up the data set. As a first step, we find the smallest and 
+largest time point for each gvkey. We will use this as the baseline data set
+
+```{r make_base}
+invisible(compu[, ym_use := ym + 3L]) # lag w/ 3 months
+base_set <- compu [, .(start = min(ym_use), stop = max(ym_use)), by = gvkey]
+
+#####
+# add market data
+stopifnot(all(base_set$gvkey %in% market$gvkey))
+invisible(market[, ym_use := ym + 1L]) # lag w/ 1 month
+base_set <- merge(
+  base_set, market[, .(mstart = min(ym_use), mstop = max(ym_use)), by = gvkey],
+  by = "gvkey")
+invisible(base_set[
+  , `:=`(start = pmin(mstart, start), stop = pmax(mstop, stop), 
+         mstart = NULL, mstop = NULL)])
+
+#####
+# add distance-to-default
+DtD <- data.table(DtD)
+stopifnot(
+  # we are missing some
+  any(!base_set$gvkey %in% DtD$gvkey))
+# add w/ 3 months due to debt from accounting data
+invisible(DtD[, ym_use := ym + 3L]) 
+base_set <- merge(
+  base_set, DtD   [, .(mstart = min(ym_use), mstop = max(ym_use)), by = gvkey],
+  by = "gvkey")
+invisible(base_set[
+  , `:=`(start = pmin(mstart, start), stop = pmax(mstop, stop), 
+         mstart = NULL, mstop = NULL)])
+
+#####
+# add Moody
+moody <- data.table(moody)
+
+# we need the Moody-Compustat map
+stopifnot(all(base_set$gvkey %in% link$gvkey))
+base_set <- merge(base_set, link, by = "gvkey")
+stopifnot(
+  # some are missing as they have no events. Thus, we need to do a left join
+  any(!base_set$mast_issr_num %in% moody$mast_issr_num),
+  # link between Compustat and Moody is one-to-one
+  all(link[, .N, by = gvkey]$N == 1),
+  all(link[, .N, by = mast_issr_num]$N == 1))
+
+moody$ym <- make_ym(moody$status_start)
+moody <- merge(moody, link, by = "mast_issr_num")
+base_set <- merge(
+  # we have to substract one from the `mstart` as this is an event and not a 
+  # covariate
+  base_set, moody [, .(mstart = min(ym) - 1L, mstop = max(ym)), by = gvkey],
+  by = "gvkey", all.x = TRUE)
+invisible(base_set[
+  , `:=`(start = pmin(mstart, start, na.rm = TRUE), 
+         stop  = pmax(mstop , stop , na.rm = TRUE), 
+         mstart = NULL, mstop = NULL)])
+
+#####
+# add monthly data
+stopifnot(all(base_set$gvkey %in% mth$gvkey))
+invisible(mth[, ym_use := ym + 1L]) # lag w/ 1 month
+base_set <- merge(
+  base_set, mth   [, .(mstart = min(ym_use), mstop = max(ym_use)), by = gvkey],
+  by = "gvkey")
+invisible(base_set[
+  , `:=`(start = pmin(mstart, start), stop = pmax(mstop, stop), 
+         mstart = NULL, mstop = NULL)])
+
+# set start and stop times back to integer values
+invisible(base_set[, `:=`(start = as.integer(start + sign(start) * 1e-2), 
+                          stop  = as.integer(stop  + sign(stop)  * 1e-2))])
+```
+
+Check result
+
+```{r check_base}
+length(unique(base_set$gvkey)) # number of firms
+hist(make_ym_inv(base_set$start), breaks = "years")
+hist(make_ym_inv(base_set$stop), breaks = "years")
+
+stopifnot(
+  !anyDuplicated(base_set$mast_issr_num), !anyDuplicated(base_set$gvkey))
+```
+
+Merge data sets. First using `tmerge`
+
+```{r merge_data}
+library(survival)
+mrg <- tmerge(base_set, base_set, id = gvkey, tstart = start, tstop = stop)
+
+# add market data
+invisible(market[, mk_idx := 1:.N])
+mrg <- tmerge(
+  mrg, market[gvkey %in% mrg$gvkey, .(gvkey, ym_use, mk_idx)], 
+  id = gvkey, mk_idx = tdc(ym_use, mk_idx))
+
+# add distance-to-default
+invisible(DtD[, dtd_idx := 1:.N])
+mrg <- tmerge(
+  mrg, DtD[gvkey %in% mrg$gvkey, .(gvkey, ym_use, dtd_idx)], 
+  id = gvkey, dtd_idx = tdc(ym_use, dtd_idx))
+
+# add Compustat data
+invisible(compu[, com_idx := 1:.N])
+mrg <- tmerge(
+  mrg, compu[gvkey %in% mrg$gvkey, .(gvkey, ym_use, com_idx)], 
+  id = gvkey, com_idx = tdc(ym_use, com_idx))
+
+# add monthly data
+invisible(mth[, mth_idx := 1:.N])
+mrg <- tmerge(
+  mrg, mth[gvkey %in% mrg$gvkey, .(gvkey, ym_use, mth_idx)], 
+  id = gvkey, mth_idx = tdc(ym_use, mth_idx))
+
+# add macro data. Lag w/ 1 month
+invisible(macro_dat[, `:=`(mac_idx = 1:.N, ym_use = ym + 1L)])
+macro_mrg <- base_set[
+  , macro_dat[ym_use >= start & ym_use <= stop, .(mac_idx, ym_use)], 
+  by = gvkey]
+mrg <- tmerge(
+  mrg, macro_mrg, 
+  id = gvkey, mac_idx = tdc(ym_use, mac_idx))
+
+# add event flags
+mrg <- tmerge(
+  mrg, moody[
+    gvkey %in% mrg$gvkey & status == "default", .(gvkey, ym, status)], 
+  id = gvkey, is_distress = cumevent(ym))
+mrg <- tmerge(
+  mrg, moody[
+    gvkey %in% mrg$gvkey & status == "maybe normal", .(gvkey, ym, status)], 
+  id = gvkey, is_mby_normal = cumevent(ym))
+
+# format columns
+mrg <- data.table(mrg)
+invisible(mrg[, `:=`(
+  tstart = as.integer(tstart + sign(tstart) * 1e-2), 
+  tstop  = as.integer(tstop  + sign(tstop)  * 1e-2), 
+  start = NULL, stop = NULL)])
+```
+
+Merge with the added identifiers. We add a `ym` variable for each data set
+to later be able to exclude data with "old" entries
+
+```{r add_covs}
+mrg_func <- function(x, y, by){
+  keep <- !colnames(y) %in% c(colnames(x), "permno", "ym", "ym_use") | 
+    colnames(y) %in% c(deparse(substitute(by)))
+  if(any(!keep))
+    cat("Dropping these", paste0(sQuote(colnames(y)[!keep]), collapse = ", "), 
+        "\n")
+  
+  ym_col <- paste0(deparse(substitute(y)), "_ym_use")
+  keep <- c(colnames(y)[keep], ym_col)
+  
+  expr <- substitute({
+      y[, ym_col := ym_use]
+      merge(x, y[, keep, with = FALSE], by = by, all.x = TRUE)
+    }, 
+    list(x = substitute(x), y = substitute(y), keep = keep, 
+         by = deparse(substitute(by)), ym_col = ym_col))
+  cat("\nRunning:\n", 
+      paste(head(deparse(expr)[-1], -1), sep = "\n", collapse = "\n"), "\n", 
+      sep = "")
+  
+  out <- eval(expr)
+  
+  list(data = out, names = keep, ym_col = ym_col)
+}
+
+tmp <- mrg_func(mrg  , mth      , mth_idx)
+final <- tmp$data
+mth_names <- tmp[c("names", "ym_col")]
+
+tmp <- mrg_func(final, market   , mk_idx)
+final <- tmp$data
+mk_names <- tmp[c("names", "ym_col")]
+
+tmp <- mrg_func(final, compu    , com_idx)
+cmp_names <- tmp[c("names", "ym_col")]
+final <- tmp$data
+
+tmp <- mrg_func(final, macro_dat, mac_idx)
+mac_names <- tmp[c("names", "ym_col")]
+final <- tmp$data
+
+tmp <- mrg_func(final, DtD      , dtd_idx)
+DtD_names <- tmp[c("names", "ym_col")]
+final <- tmp$data
+```
+
+Sanity check
+
+```{r check_after_make_final}
+stopifnot(
+  # one observation per firm and tstart
+  all(final[, .N, by = c("gvkey", "tstart")]$V1 == 1),
+  # ditto w/ tstop
+  all(final[, .N, by = c("gvkey", "tstop")]$V1 == 1), 
+  # all macro vars are equal at each time point
+  all(
+    final[, all(sapply(.SD, function(x) all(is.na(x)) | all(x == x[1]))), 
+          by = "tstart", .SD = c("r1y", "log_market_ret")]$V1))
+```
+
+
+## SIC codes
+
+We need the SIC codes to exclude holding companies and financial firms. 
+We do kinda like [Farma & French](http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/Data_Library/det_48_ind_port.html) (maybe check [this page](https://wrds-support.wharton.upenn.edu/hc/en-us/articles/115003440892-Explaining-inconsistencies-between-SIC-code-in-CRSP-and-SICH-Standard-Industrial-Classification-Historical-in-Compustat)
+on WRDS to)
+
+> We assign each NYSE, AMEX, and NASDAQ stock to an industry portfolio at the 
+end of June of year t based on its four-digit SIC code at that time. (We use 
+Compustat SIC codes for the fiscal year ending in calendar year t-1. Whenever 
+Compustat SIC codes are not available, we use CRSP SIC codes for June of year 
+t.)
+
+What we do is 
+
+ 1. Take the `sich` code from Compustat if it is present
+ 2. if not take the most recent `siccd` from CRSP if present and more 
+    recent than at most one year ago
+
+```{r deal_w_sic}
+# sich    Compustats sic code
+# hsiccd  'head' sic code from CRSP for the `permno` and not `gvkey`
+# siccd   sic code from CRSP for the `permno` and not `gvkey`
+set.seed(72559285)
+final[sample.int(nrow(final), 10), .(sich, hsiccd, siccd, gvkey)]
+
+# the codes are non-static
+stopifnot(
+  any(final[, length(unique(sich)) , by = "gvkey"]$V1 > 1), 
+  any(final[, length(unique(siccd)), by = "gvkey"]$V1 > 1))
+
+setkey(final, gvkey, tstart) # sort data
+# function assumes that data is sorted
+func <- function(siccd, sich, tstart, mth_ym_use){
+  is_na <- is.na(sich)
+  if(!any(is_na))
+    return(sich)
+  
+  is_na <- which(is_na)
+  for(i in is_na){
+    mth_ym <- mth_ym_use[1:i]
+    keep <- !is.na(siccd[1:i]) & !is.na(mth_ym) & mth_ym > tstart[i] - 12L
+    keep <- which(keep)
+    if(length(keep) < 1)
+      next
+    sich[i] <- siccd[max(keep)]
+  }
+  
+  sich 
+}
+
+final[, sic_use := func(siccd, sich, tstart, mth_ym_use), by = gvkey]
+mean(is.na(final$sic_use))
+mean(is.na(final$siccd))
+```
+
+<!-- View(final[gvkey == "001086", .(sic_use, siccd, sich, tstart, compu_ym_use)]) -->
+
+## Carry last observation forward
+
+```{r check_rebuild_two, include = FALSE}
+if(!interactive()){
+  .check_before_merge <- file.path("data", "merge_check")
+  if(!file.exists(.check_before_merge)){
+    knitr::opts_chunk$set(cache.rebuild = TRUE)
+  } else
+    knitr::opts_chunk$set(
+      cache.rebuild = knitr::opts_chunk$get("cache.rebuild") ||
+        !readRDS(.check_before_merge) == digest::digest(final))
+  
+  saveRDS(digest::digest(final), .check_before_merge)
+}
+```
+
+Use carry last observation forward and deal with invalid (too old) data
+
+<!-- 
+  knitr::opts_knit$set(output.dir = ".")
+  knitr::load_cache(
+    "carry_fw", 
+    path = paste0(file.path("markdown", "cache", "merging"), 
+                  .Platform$file.sep))
+-->
+
+```{r carry_fw, cache = 1}
+setkey(final, gvkey, tstart) # sort
+fi <- copy(final) # had to do this to get caching in knitr to work
+rm(final)
+
+# function that assumes that data is sorted
+carry_fw <- function(x, ti, width){
+  is_na <- is.na(x)
+  if(!any(is_na))
+    return(x)
+  
+  is_na <- which(is_na)
+  for(i in is_na){
+    if(i == 1L)
+      next
+    sub_ti <- ti[1:(i - 1L)]
+    keep <- which(sub_ti < ti[i] & sub_ti >= ti[i] - width)
+    keep <- setdiff(keep, is_na)
+    if(length(keep) < 1L)
+      next
+    x[i] <- x[max(keep)]
+  }
+  
+  x
+}
+carry_fw <- compiler::cmpfun(carry_fw)
+
+# we use market data for at most three months. We print the fraction of 
+# missing values before and after
+
+# Let us make an example at the code
+#      tstart_old          >= tstart - max_dist
+#  <=> tstart - tstart_old <= max_dist
+# we use the market data at `market_ym_use - tstart == 0` and then 
+# an additional `max_dist` months. Next, the 
+#     | tstart - market_ym_use >= max_dist
+# implies agian that we use data when `tstart == market_ym_use` and up to 
+# `tstart = market_ym_use + max_dist`
+
+max_dist <- 3L
+fi[, sapply(.SD, function(x) mean(is.na(x))), .SD = mk_names$names]
+fi[, (mk_names$names) := 
+        lapply(.SD, carry_fw, ti = tstart, width = max_dist), 
+      by = gvkey, .SD = mk_names$names]
+fi[, sapply(.SD, function(x) mean(is.na(x))), .SD = mk_names$names]
+
+fi[
+  , is_invalid := is.na(market_ym_use) | tstart - market_ym_use >= max_dist]
+mean(fi$is_invalid)
+
+fi[, tstop_cap := pmin(tstop, market_ym_use + max_dist, na.rm = TRUE)]
+
+# we also do not include a firm after it has delisted
+fi[, dlstdt_ym := ifelse(is.na(dlstdt), NA_integer_, make_ym(dlstdt))]
+fi[, tstop_cap := pmin(tstop, dlstdt_ym, na.rm = TRUE)]
+fi[!is.na(dlstdt_ym), is_invalid := is_invalid | tstop > dlstdt_ym]
+mean(fi$is_invalid)
+
+# we carry distance-to-default data forward for three months. We print the 
+# fraction of missing values before and after
+max_dist <- 3L
+fi[, sapply(.SD, function(x) mean(is.na(x))), .SD = DtD_names$names]
+fi[, (DtD_names$names) := 
+        lapply(.SD, carry_fw, ti = tstart, width = max_dist), 
+      by = gvkey, .SD = DtD_names$names]
+fi[, sapply(.SD, function(x) mean(is.na(x))), .SD = DtD_names$names]
+
+fi[
+  , is_invalid := is_invalid | is.na(DtD_ym_use) | 
+    tstart - DtD_ym_use >= max_dist]
+mean(fi$is_invalid)
+
+fi[, tstop_cap := pmin(tstop_cap, DtD_ym_use + max_dist, na.rm = TRUE)]
+
+# we carry Compustat data forward for 12 months. We print the 
+# fraction of missing values before and after
+max_dist <- 12L
+fi[, sapply(.SD, function(x) mean(is.na(x))), .SD = cmp_names$names]
+fi[, (cmp_names$names) := 
+        lapply(.SD, carry_fw, ti = tstart, width = max_dist), 
+      by = gvkey, .SD = cmp_names$names]
+fi[, sapply(.SD, function(x) mean(is.na(x))), .SD = cmp_names$names]
+
+fi[
+  , is_invalid := is_invalid | is.na(compu_ym_use) | 
+    tstart - compu_ym_use >= max_dist]
+mean(fi$is_invalid)
+
+fi[, tstop_cap := pmin(tstop_cap, compu_ym_use + max_dist, na.rm = TRUE)]
+fi[, tstop_cap := as.integer(tstop_cap + sign(tstop_cap) * 1e-2)]
+```
+
+## Add prior distress indicator and event types
+
+```{r prior_distress}
+final <- fi
+rm(fi)
+setkey(final, gvkey, tstart) # sort
+
+final[, has_prior_distress := 
+        cumsum(shift(is_distress, fill = 0)) > 0L, by = gvkey]
+```
+
+```{r add_event_types}
+final <- merge(
+  final, moody[!is.na(ev_type), .(ym, gvkey, ev_type)], 
+  by.x = c("gvkey", "tstop"), by.y = c("gvkey", "ym"), all.x = TRUE)
+
+stopifnot(all(final[, (is_distress > 0L) == !is.na(ev_type)]))
+```
+
+
+## Check status over time
+
+<div class="hideable">
+
+```{r check_status_inter, cache = 1}
+local({
+  tmp <- final[is_distress == TRUE, tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+  
+  tmp <- final[is_distress != TRUE, tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+})
+```
+
+</div>
+
+
+## Define final outcome variable and handle censoring after event
+
+We
+
+ 1. Make status variable such that it has "`distress`" from `is_distress` to 
+    the last `!is_invalid` entry.
+ 2. Make the status `"non-normal"` between the row after `is_distress` and 
+    `is_mby_normal`.
+
+```{r add_distress_status}
+# check 
+stopifnot(all(final[, tstop >= tstop_cap]))
+
+# sort data
+setkey(final, gvkey, tstart)
+
+# format data
+final[, `:=`(
+  is_mby_normal = is_mby_normal > 0, is_distress = is_distress > 0)]
+
+# assign function to make status and distress event times variables going 
+# backward from the event indicator to last valid entry. We later only include
+# those status changes that are sufficiently close in time. The functioon 
+# assumes that data is sorted
+func <- function(is_invalid, is_distress, tstop, ev_type){
+  n <- length(is_distress)
+  status        <- rep("normal"     , n)
+  distress_time <- rep(NA_integer_  , n)
+  distress_type <- rep(NA_character_, n)
+  if(!any(is_distress))
+    return(list(status = status, distress_time = distress_time, 
+                distress_type = distress_type))
+  
+  for(i in which(is_distress)){
+    # find nearest valid obs
+    ds_time_i <- tstop[i]
+    last_valid <- which(!is_invalid[1:i])
+    last_valid <- if(length(last_valid) < 1) 
+      # the one here does not matter. It could be any value between 1:i as we 
+      # remove the row later anyway
+      1L else max(last_valid)
+    
+    # set status and distress time
+    status       [last_valid:i] <- "distress"
+    distress_time[last_valid:i] <- ds_time_i
+    
+    distress_type[last_valid] <- if(!is.na(distress_type[last_valid]))
+      # concatenate the events
+      paste0(distress_type[last_valid], ":", ev_type[i]) else
+        ev_type[i]
+  }
+  
+  list(status = status, distress_time = distress_time, 
+       distress_type = distress_type)
+}
+func <- compiler::cmpfun(func)
+final[, c("status", "distress_time", "distress_type") := 
+            func(is_invalid, is_distress, tstop, ev_type), by = gvkey]
+
+# checks
+stopifnot(
+  all(final[, is.na(distress_time) | tstop <= distress_time]), 
+  sum(final$is_distress) >= 
+    sum(final[status == "distress" & !is_invalid]$is_distress),
+  all(
+    final[, sum(is_distress), by = gvkey]$V1 >= 
+      final[, sum(status == "distress" & !is_invalid), by = gvkey]$V1),
+  # may be lower due to concatenation
+  sum(!is.na(final$distress_type)) <= sum(final$is_distress))
+
+# how many events do have after a given a given period of time
+cat(
+  "We have", 
+  final[
+    , sum(status == "distress" & !is_invalid & distress_time - tstop < 12L)], 
+  "events after one year", 
+  final[
+    , sum(status == "distress" & !is_invalid & distress_time - tstop < 24L)],
+  "events after two years", 
+  final[
+    , sum(status == "distress" & !is_invalid & distress_time - tstop < 36L), ],
+  "events after three years and", 
+  final[
+    , sum(status == "distress" & !is_invalid                              ), ], 
+  "events in total\n")
+
+# distribution of event types
+tail(sort(table(final[!is_invalid & status == "distress", distress_type])), 15)
+```
+
+Re-do plot now with status variable 
+
+<div class="hideable">
+
+```{r check_status_inter_redo, cache = 1}
+local({
+  tmp <- final[status == "distress", tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+  
+  tmp <- final[status != "distress", tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+})
+```
+
+</div>
+
+Next we need to handle the period after an event where we will not include the 
+observations
+
+```{r use_is_mby_normal}
+# check that all `is_distress` are followed by an `is_mby_normal`
+setkey(final, gvkey, tstart) # sort data
+# function assumes that data is sorted
+func <- function(is_distress, is_mby_normal, gvkey){
+  if(sum(is_distress) != sum(is_mby_normal))
+    stop("Count of binaries do not match for", sQuote(gvkey[1]))
+  if(!any(is_distress))
+    return(invisible())
+  
+  # check that the `is_mby_normal` comes after the `is_distress`
+  is_distress <- which(is_distress)
+  is_mby_normal <- which(is_mby_normal)
+  if(any(is_distress > is_mby_normal))
+    stop("Some ", sQuote("is_distress"), " comes after the ", 
+         sQuote("is_mby_normal"), " for ", sQuote(gvkey[1]))
+  
+  invisible()
+}
+invisible(final[, func(is_distress, is_mby_normal, gvkey), by = gvkey])
+
+# having checked the data, then we set a flag from the row following the 
+# last distress flag to the `is_mby_normal` flag and exclude these statuses. 
+# This function also assumes that data is sorted
+func <- function(is_distress, is_mby_normal, status){
+  if(!any(is_mby_normal))
+    return(status)
+  
+  is_distress <- which(is_distress)
+  is_mby_normal <- which(is_mby_normal)
+  for(i in seq_along(is_mby_normal)){
+    if(is_distress[i] == is_mby_normal[i])
+      # happens if there is a resolution date on the same month as the default
+      next
+    idx <- (is_distress[i] + 1L):is_mby_normal[i]
+    status[idx] <- "non-normal"
+  }
+  
+  return(status)
+}
+invisible(final[
+  , status := func(is_distress, is_mby_normal, status), by = gvkey])
+```
+
+Redo-plot
+
+<div class="hideable">
+
+```{r check_status_inter_again, cache = 1}
+local({
+  tmp <- final[status == "distress", tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+  
+  tmp <- final[status == "non-normal", tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+  
+  tmp <- final[status != "distress", tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+})
+```
+
+</div>
+
+Check results
+
+```{r}
+final[
+  , .(
+    `Total length in status` = sum(tstop - tstart), 
+    `Mean length in status` = mean(tstop - tstart)), 
+  by = "status"]
+final[
+  is_invalid == FALSE, .(
+    `Total length in status` = sum(tstop - tstart), 
+    `Mean length in status` = mean(tstop - tstart)), 
+  by = "status"]
+```
+
+## Exclude firms based on SIC
+We now drop firm-months based on SIC code. We do this now since we have carried 
+forward values
+
+```{r drop_sic}
+final$sic_use <- as.integer(final$sic_use + 1e-2)
+
+nrow(final) # number of firm-months
+length(unique(final$gvkey)) # number of firms
+
+# exclude "Finance, Insurance and Real Estate"
+final <- final[!is.na(sic_use) & (sic_use > 6999L | sic_use < 6000L)]
+
+# we also exlucde those in group 9000 or greater. These are "public 
+# administration" or "nonclassifiable"
+nrow(final)
+final <- final[!sic_use > 8999L]
+
+nrow(final) # number of firm-months
+length(unique(final$gvkey)) # number of firms
+sum(!final$is_invalid)
+```
+
+## Exclude non-normal rows, invalid rows, and rows pre a given date
+
+```{r save_pre_table}
+# save table
+saveRDS(final, file.path("data", "final_pre_excl.RDS"))
+
+nrow(final)
+final <- final[!is_invalid & status != "non-normal"]
+nrow(final)
+
+# cut off after a given date
+cut_dt <- make_ym(as.Date("1980-01-01"))
+final <- final[cut_dt < tstop_cap]
+nrow(final)
+final[, tstart := pmax(cut_dt, tstart)][
+  , tstart := as.integer(tstart + sign(tstart) * 1e-2)]
+```
+
+Redo plot
+
+<div class="hideable">
+
+```{r check_status_inter_after_excl, cache = 1}
+local({
+  tmp <- final[status == "distress", tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+  
+  tmp <- final[status != "distress", tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+})
+```
+
+</div>
+
+## Prepare covariates
+
+Drop some columns that we do not need
+
+```{r drop_cols}
+final <- final[
+  , setdiff(colnames(final), c(
+    "a_datadate", "a_fyear", "a_fyr", "act", "at", "che", "com_idx", 
+    "consol", "costat", "datadate", "datafmt", "date", "dlc", "dltt", 
+    "dtd_idx", "DtD_ym_use", "fyearq", "fyr", "compu_ym_use",
+    "id", "indfmt", "is_distress", "is_invalid", "is_last", "is_mby_normal", 
+    "lct", "lt", "mac_idx", "macro_dat_ym_use", "market_ym_use", 
+    "mk_idx", "mth_idx", "mth_ym_use", "ni", "oiadp", "pstkl", "re", 
+    "rect", "sale", "seq", "success", "txdb", "txditc", "vol", "wcap", "r3m"))
+  , with = FALSE]
+```
+
+Check fraction of missing values
+
+<div class="hideable">
+
+```{r chec_frac_missing}
+sort(sapply(final, function(x) mean(is.na(x))))
+```
+
+</div>
+
+Compute the ratios with total assets
+
+<div class="hideable">
+
+```{r total_asset_ratios}
+total_asset_ratio_vars <- c(
+  "wcapq", "req", "oiadpq", "saleq", "niq", "ltq", "cheq")
+
+# we do not have issues with zeroes or `NA` total assets
+stopifnot(!any(is.na(final$atq)), !any(final$atq <= 0))
+
+frac_names <- paste0("r_", total_asset_ratio_vars, "_atq")
+final[, (frac_names) := lapply(.SD, `/`, atq), .SD = total_asset_ratio_vars]
+
+# check summary stats
+sum_func <- function(x){
+  qs <- quantile(x, na.rm = TRUE, probs = c(.01, .99))
+  x_winz <- pmin(pmax(x, qs[1]), qs[2])
+  c(
+    mean      = mean(x     , na.rm = TRUE), sd      = sd(x     , na.rm = TRUE),
+    `mean wz` = mean(x_winz, na.rm = TRUE), `wz sd` = sd(x_winz, na.rm = TRUE),
+    `frac na` = mean(is.na(x)), 
+    quantile(x, na.rm = TRUE, probs = c(.01, .25, .5, .75, .99)))
+}
+sapply(final[, frac_names, with = FALSE], sum_func)
+
+# Idea: do kinda like in Campbell et al. (2008) by taking 50% of the market 
+#       value and 50% of the total assets. The new numerator may contain more
+#       timely information
+stopifnot(!any(is.na(final$mv)), !any(final$mv <= 0))
+quantile(final[, mv / atq]) # mv is in thousands
+
+frac_names <- paste0("r_", total_asset_ratio_vars, "_nn")
+final[, nn := mv * .5 / 1000 + atq * .5][ # nn: new numerator 
+  , (frac_names) := lapply(.SD, `/`, nn), .SD = total_asset_ratio_vars]
+
+# check summary stats
+sapply(final[, frac_names, with = FALSE], sum_func)
+```
+
+</div>
+
+Compute ratios with other variables 
+
+```{r other_ratios}
+# market to total assets 
+quantile(final[, mv / atq]) # mv is in thousands
+sum(final$atq < 1e-2, na.rm = TRUE)
+final[, r_mv_atq := mv / (atq * 1000)]
+
+# market to book
+mean(is.na(final$be))
+sum(final$be < 1e-2, na.rm = TRUE)
+# do as suggested in Cambell et al. (2008) page 2905-2906
+final[, be_new := be + .1 * (mv / 1000 - be)]
+sum(final$be_new < 1e-2, na.rm = TRUE)
+quantile(final$be_new, probs = seq(0, 1, .025), na.rm = TRUE)
+quantile(final$be    , probs = seq(0, 1, .025), na.rm = TRUE)
+final[!is.na(be_new), be_new := pmax(be_new, 1)]
+final[, m_t_b := mv / (be_new * 1000)]
+quantile(final$m_t_b, probs = sort(c(seq(0, 1, .05), .98, .99)))
+
+# Current assets to current liabilities (current ratio). We have a few zeros 
+# and NAs
+sum(is.na(final$lctq))
+sum(final$lctq < 1e-2, na.rm = TRUE)
+final[, r_actq_lctq := ifelse(lctq < 1e-2, NA_real_, actq / lctq)]
+
+# market equity to total liabilities. We have a no NAs and a few negative total 
+# liabilities. We set the latter to NA
+stopifnot(!any(is.na(final$ltq)), any(final$ltq < 0))
+sum(final$ltq < 1e-2, na.rm = TRUE)
+final[, r_mv_ltq := ifelse(ltq <= 0, NA_real_, mv / (ltq * 1000))]
+
+# check stats
+sapply(final[, .(r_mv_atq, r_actq_lctq, r_mv_ltq)], sum_func)
+```
+
+Cap the stop times and the event variables 
+
+```{r cap_stop_n_event}
+# check lag between covariate valid end dates and distress time
+stopifnot(all(final[, is.na(distress_time) | distress_time >= tstop_cap]), 
+          all(final[, tstop >= tstop_cap]), 
+          all(final[, tstop_cap > tstart]))
+cat(
+  "We have", 
+  final[
+    , sum(status == "distress" & distress_time - tstop_cap <  6L)],
+  "events after six months",
+  final[
+    , sum(status == "distress" & distress_time - tstop_cap < 12L)], 
+  "events after one year", 
+  final[
+    , sum(status == "distress" & distress_time - tstop_cap < 24L)],
+  "events after two years", 
+  final[
+    , sum(status == "distress" & distress_time - tstop_cap < 36L)],
+  "events after three years and", 
+  final[
+    , sum(status == "distress"                                  )], 
+  "events in total\n")
+
+# `tstop_cap` is the last point at which the covariate vector is valid. Thus, 
+# we use `<`. 
+final[, y := status == "distress" & distress_time - tstop_cap < 12L][
+  , `:=`(tstop_org = tstop, tstop = tstop_cap)]
+
+# distribution of event types
+stopifnot(all(final[y == TRUE, !is.na(distress_type)]))
+tail(sort(table(final[y == TRUE, distress_type])), 15)
+```
+
+Redo plot
+
+<div class="hideable">
+
+```{r check_status_inter_again_redo, cache = 1}
+local({
+  tmp <- final[status == "distress", tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+  
+  tmp <- final[status != "distress", tstop]
+  tmp <- table(make_ym_inv(tmp))
+  plot(c(tmp) ~ as.Date(dimnames(tmp)[[1]]), type = "h", 
+       xlab = "Time", ylab = "Number of firms")
+  
+  tmp <- final[, sum(y) / .N, by = tstop][, tstop := make_ym_inv(tstop)]
+  plot(tmp$V1 ~ tmp$tstop, type = "h", ylab = "distress rate")
+  lines(smooth.spline(tmp$tstop, tmp$V1), lwd = 2, col = "DarkGreen")
+})
+```
+
+</div>
+
+Sanity checks before we save
+
+<div class="hideable">
+
+```{r check_res}
+# Distribution of number of events by firms
+xtabs(~final[, sum(y), by = gvkey]$V1)
+
+# how many have prior events
+mean(final[, any(has_prior_distress), by = gvkey]$V1)
+
+# Distribution of industries
+final[, two_digi_sic := substr(sprintf('%04d', sic_use), 1, 2)]
+local({
+  xt <- xtabs(~ final[, unique(two_digi_sic), by = gvkey]$V1)
+  dimnames(xt)[[1]] <- paste0("SIC", dimnames(xt)[[1]])
+  print(xt)
+})
+
+# rough idea of industry effects (disregards if there are different 
+# tstart - tstop intervals -- does not happen if monthly frequency macro data is 
+# added). 
+tmp <- final[, .(`distress rate` = mean(y), N = .N, 
+                 `n firms` = length(unique(gvkey))), by = two_digi_sic]
+tmp[order(-`distress rate`)]
+final[, two_digi_sic := NULL]
+
+# number of firms
+length(unique(final$gvkey))
+
+# length each firms is in sample in years
+final[, .(ta = min(tstart), to = max(tstop)), by = gvkey][
+  , c(mean = mean(to - ta) / 12, sd = sd(to - ta) / sqrt(12))]
+
+# default rates for firms with and without prior distress
+(tab <- xtabs(~ has_prior_distress + y, final))
+prop.table(tab, margin = 1)
+length(unique(subset(final, has_prior_distress == TRUE)$gvkey))
+
+# sanity checks
+stopifnot(all(final[, tstart < tstop]))
+```
+
+</div>
+
+Make industry groups as in @Chava04 [pp. 554] and also make first digit groups
+
+<div class="hideable">
+
+```{r sic_grp_dummy}
+final[, sic_grp := NA_character_]
+final[
+  (sic_use < 1000L) | 
+    (sic_use >= 1500L & sic_use < 1800L) | 
+    (sic_use >= 5000L & sic_use < 6000L) | 
+    (sic_use >= 7000L & sic_use < 9000L), sic_grp := "Misc"]
+final[
+  (sic_use >= 1000L & sic_use < 1500L) |
+    (sic_use >= 2000L & sic_use < 4000L), sic_grp := "Manu mine"]
+final[(sic_use >= 4000L & sic_use < 5000L), sic_grp := "Tran commu Util"]
+stopifnot(!anyNA(final$sic_grp))
+
+# check group
+(tmp <- xtabs(~ sic_grp + y, final))
+tmp / rowSums(tmp)
+
+# get rough idea of default rate for industries (rough since tstop - tstart 
+# may be greater than one - tstop intervals -- does not happen if monthly 
+# frequency macro data is added)
+for(g in unique(final$sic_grp)){
+  with(subset(final, sic_grp == g), {
+    tmp <- xtabs(~ tstop + y)
+    plot(tmp[, "TRUE"] / rowSums(tmp) ~ make_ym_inv(as.integer(rownames(tmp))), 
+         ylab = "default rate", main = g, type = "h", xlab = "date")
+  })
+}
+
+# first digit groups
+final[, sic_grp_fine := sic_use %/% 1000]
+xtabs(~ final$sic_grp_fine) # zero is quite sparse. Merge w/ 1
+final[sic_grp_fine == 0, sic_grp_fine := 1L]
+xtabs(~ sic_grp_fine + y, final)
+prop.table(xtabs(~ sic_grp_fine + y, final), margin = 1)
+```
+
+</div>
+
+Make plots of covariates means and sds through time 
+
+<div class="hideable">
+
+```{r show_var_means_n_sd}
+local({
+  vars <- c(
+    "dtd", "excess_ret", "log_market_ret", "r_actq_lctq", "r_ltq_atq", 
+    "r_ltq_nn", "r_mv_ltq", "r_mv_atq", "r_niq_atq", "r_niq_nn", 
+    "r_oiadpq_atq", "m_t_b",
+    "r_oiadpq_nn", "r_req_atq", "r_req_nn", "r_saleq_atq", "r_saleq_nn", 
+    "r_wcapq_atq", "r_wcapq_nn", "r1y", "rel_size", "sigma")
+  
+  par(mfcol = c(2, 2), mar = c(5, 4, 1, 1))
+  for(v in vars){
+    x <- eval(parse(text = v), final)
+    keep <- !is.na(x)
+    sta <- final$tstart[keep]
+    x <- x[keep]
+    
+    mes <- tapply(x, sta, mean)
+    sds <- tapply(x, sta, sd)
+    lb <- mes - sds
+    ub <- mes + sds
+    
+    plot(make_ym_inv(as.integer(names(lb))), mes, ylim = range(lb, ub, mes), 
+         xlab = "Time", type = "l", ylab = v)
+    matlines(make_ym_inv(as.integer(names(lb))), cbind(lb, ub), lty = 3, 
+             col = "black")
+  }
+  
+  cat("Winsorized\n")
+  
+  par(mfcol = c(2, 2), mar = c(5, 4, 1, 1))
+  for(v in vars){
+    x <- eval(parse(text = v), final)
+    keep <- !is.na(x)
+    sta <- final$tstart[keep]
+    x <- x[keep]
+    
+    x <- pmin(pmax(x, quantile(x, .01)), quantile(x, .99))
+    
+    mes <- tapply(x, sta, mean)
+    sds <- tapply(x, sta, sd)
+    lb <- mes - sds
+    ub <- mes + sds
+    
+    plot(make_ym_inv(as.integer(names(lb))), mes, ylim = range(lb, ub, mes), 
+         xlab = "Time", type = "l", ylab = v)
+    matlines(make_ym_inv(as.integer(names(lb))), cbind(lb, ub), lty = 3, 
+             col = "black")
+  }
+  
+  par(mfcol = c(1, 1)) 
+  mes <- tapply(final$has_prior_distress, final$tstart, mean)
+  plot(make_ym_inv(as.integer(names(mes))), mes, 
+         xlab = "Time", type = "l", ylab = "has prior distress")
+})
+```
+
+</div>
+
+## Add issuer data
+
+```{r add_issuer_data}
+stopifnot(anyDuplicated(moody_issuer$mast_issr_num) < 1L, 
+          all(final$mast_issr_num %in% moody_issuer$mast_issr_num), 
+          is.data.table(final))
+
+final <- merge(
+  final, moody_issuer[, c("mast_issr_num", "min_sale", "max_matr", 
+                          "start_rated", "stop_rated")], 
+  by = "mast_issr_num")
+final[, `:=`(min_sale_ym = make_ym(min_sale), max_matr_ym = make_ym(max_matr))]
+
+mean(is.na(final$min_sale))
+mean(is.na(final$max_matr))
+
+# very different distress rates
+prop.table(
+  with(final, table(y, `before min sale` = tstart < min_sale_ym, 
+                    useNA = "ifany")), margin = 2)
+prop.table(
+  with(final, table(y, `after max maturity` = tstop > max_matr_ym, 
+                    useNA = "ifany")), margin = 2)
+```
+
+Illustrate how distribution observations with missing sales and maturity dates 
+looks through time and more
+
+<div class="hideable">
+
+```{r illu_missing_mat_n_sales}
+local({
+  tmp <- copy(final)
+  
+  tmp[, `:=`(date                = make_ym_inv(tstart),
+             `miss sale`         = is.na(min_sale_ym), 
+             `miss maturity`     = is.na(max_matr_ym), 
+             `is before sale`    = !is.na(min_sale_ym) & tstart < min_sale_ym, 
+             `is after sale`     = !is.na(min_sale_ym) & tstart >= min_sale_ym,
+             `is after maturity` = !is.na(max_matr_ym) & tstop > max_matr_ym, 
+             `is inside`         = !is.na(min_sale_ym) & !is.na(max_matr_ym) &
+               tstart >= min_sale_ym & tstop <= max_matr_ym)]
+  if(any(tmp[, tstop - tstart > 1L]))
+    cat("Figures may be missleading\n")
+  
+  cat("Fractions of observations in groups\n")
+  ovars <- list(
+    quote(`miss sale`), quote(`miss maturity`), quote(`is inside`),
+    quote(`is after sale`), quote(`is before sale`), quote(`is after maturity`))
+  par(mar = c(5, 4, .5, .5))
+  for(s in ovars){
+    eval(substitute({
+      o <- tmp[, .(mean(s)), by = date]
+      colnames(o)[2] <- deparse(quote(s))
+      with(o, plot(`date`, s, type = "h", ylim = c(0, 1)))
+    }, list(s = s)))
+  }
+  
+  cat("Distress rates in groups\n")
+  par(mar = c(5, 4, 2, .5))
+  for(s in ovars){
+    eval(substitute({
+      o <- tmp[s == TRUE, .(`distress rate` = mean(y)), by = date]
+      with(o, plot(`date`, `distress rate`, type = "h", ylim = c(0, .02), 
+                   main = deparse(quote(s))))
+    }, list(s = s)))
+  }
+  
+  cat("Size of the firms\n")
+  for(s in ovars){
+    eval(substitute({
+      o <- tmp[s == TRUE, .(
+        `mean relative size`   = mean(rel_size, na.rm = T),
+        `median relative size` = median(rel_size, na.rm = T)), by = date]
+      setkey(o, date)
+      with(o, {
+        plot(`date`, `mean relative size`, type = "l", 
+             main = deparse(quote(s)), ylim = c(-12, -6))
+        lines(`date`, `median relative size`, lty = 2)
+      })
+    }, list(s = s)))
+  }
+})
+```
+
+</div>
+
+It is not entirely clear when Moody's do track a firm but the results do suggest 
+that one needs to account for it. Another option is to include a firm when it
+is rated by Moody's
+
+<div class="hideable">
+
+```{r track_moodys}
+# fraction missing
+stopifnot(with(final, is.na(stop_rated) == is.na(start_rated)))
+mean(is.na(final$stop_rated))
+
+final <- within(final, {
+  start_rated_ym <- make_ym(start_rated)
+  stop_rated_ym <- make_ym(stop_rated)
+})
+
+prop.table(
+  with(final, table(y, `before rated` = tstart < start_rated_ym, 
+                    useNA = "ifany")), margin = 2)
+prop.table(
+  with(final, table(y, `after rated` = tstop > stop_rated_ym, 
+                    useNA = "ifany")), margin = 2)
+
+local({
+  tmp <- copy(final)
+  
+  tmp[, `:=`(date           = make_ym_inv(tstart),
+             `before rated` = !is.na(start_rated_ym) & tstart < start_rated_ym, 
+             `after rated`  = !is.na(stop_rated_ym) & tstop > stop_rated_ym, 
+             `is inside`    = !is.na(stop_rated_ym) & 
+               tstart >= start_rated_ym & tstop <= stop_rated_ym)]
+  if(any(tmp[, tstop - tstart > 1L]))
+    cat("Figures may be missleading\n")
+  
+  cat("Fractions of observations in groups\n")
+  ovars <- list(
+    quote(`before rated`), quote(`after rated`), quote(`is inside`))
+  par(mar = c(5, 4, .5, .5))
+  for(s in ovars){
+    eval(substitute({
+      o <- tmp[, .(mean(s)), by = date]
+      colnames(o)[2] <- deparse(quote(s))
+      with(o, plot(`date`, s, type = "h", ylim = c(0, 1)))
+    }, list(s = s)))
+  }
+  
+  cat("Distress rates in groups\n")
+  par(mar = c(5, 4, 2, .5))
+  for(s in ovars){
+    eval(substitute({
+      o <- tmp[s == TRUE, .(`distress rate` = mean(y)), by = date]
+      with(o, plot(`date`, `distress rate`, type = "h", ylim = c(0, .02), 
+                   main = deparse(quote(s))))
+    }, list(s = s)))
+  }
+  
+  cat("Size of the firms\n")
+  for(s in ovars){
+    eval(substitute({
+      o <- tmp[s == TRUE, .(
+        `mean relative size`   = mean(rel_size, na.rm = T),
+        `median relative size` = median(rel_size, na.rm = T)), by = date]
+      setkey(o, date)
+      with(o, {
+        plot(`date`, `mean relative size`, type = "l", 
+             main = deparse(quote(s)), ylim = c(-12, -6))
+        lines(`date`, `median relative size`, lty = 2)
+      })
+    }, list(s = s)))
+  }
+})
+```
+
+</div>
+
+## Save
+
+```{r save_final}
+# we add commit id and branche to the final output. This way, we can check the 
+# `RDS` and see what code was (presumably) used to create it
+git_id <- system("git rev-parse --short HEAD", intern = TRUE)
+git_bra <- system("git branch", intern = TRUE)
+regexp <- "^(\\*\ )(.+)$"
+git_bra <- git_bra[grepl(regexp, git_bra)]
+git_bra <- gsub(regexp, "\\2", git_bra)
+
+saveRDS(list(
+  data = as.data.frame(final), ym_funcs = list(
+    make_ym = make_ym, make_ym_inv = make_ym_inv), git_info = list(
+      branch = git_bra, id = git_id)), 
+  file.path("data", "final.RDS"))
+```
+
+
+## References

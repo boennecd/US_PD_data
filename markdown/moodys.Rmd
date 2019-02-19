@@ -1,0 +1,1234 @@
+---
+title: "Moody's default and recovery database"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+bibliography: refs.bib
+---
+
+<script>
+$(document).ready(function(){
+  var hide_divs = $("div.hideable");
+  hide_divs.each(function(){
+    // Wrap content in div
+    $(this).wrapInner( "<div class='hideable_content', style='display: none;'></div>");
+    
+    // Add button
+    $(this).prepend("<button id='toogle'>show</button>");
+  });
+  
+  // Add hideable btn
+  // Put the rest in a div
+  
+  $("div.hideable button#toogle").click(function(){
+    var parent = $(this).parent();
+    var target_div = $(parent).find("div.hideable_content");
+    
+    if(target_div.css("display") == "none"){
+      target_div.show();
+        $(this).text("Hide");
+    } else {
+      target_div.hide();
+      $(this).text("Show");
+    }
+  });
+});
+</script>
+
+```{r setup, include=FALSE, cache=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  fig.height = 4, fig.width = 7, dpi = 128, comment = "#R",
+  cache.path = paste0(file.path("cache", "moodys"), .Platform$file.sep), 
+  fig.path   = paste0(file.path("fig"  , "moodys"), .Platform$file.sep),
+  error = FALSE)
+options(digits = 4, scipen = 10, width = 70)
+```
+
+The goal in this file is to create an event table like e.g., the [crpsa.dse](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=137&file_id=67053)
+(the event table) from CRSP. The events we are interested in is when the firm 
+is active and when it defaults.
+
+## Connecting to the data base
+I assume that you have set up the ODBC called Moodys. E.g. for windows user see http://www.stata.com/support/faqs/data-management/configuring-odbc-win/. 
+You may need to install this component 
+https://www.microsoft.com/en-us/download/details.aspx?id=13255.
+
+```{r connect_db}
+library(RODBC)
+db_con <- odbcConnect("Moodys")
+tbls <- sqlTables(db_con)
+tbls$TABLE_NAME # print the names of the tables
+```
+
+## What is the scope of the database 
+From the *Moody's Analytics Default & Recovery Database (DRD): Frequently Asked Questions and Reference Guide* 
+file
+
+> CORPORATE DEFAULT DATA
+>
+> ...
+>
+> The database includes information on every issuer where the Default Research 
+analyst was able to find evidence of an actual default. This includes both 
+the Moody's rated and unrated universe. It is not a representative sample, but 
+rather the full population that Moody's is aware of each month. It is possible 
+that there are additional defaults in the market that Moody's has not been able 
+to confirm.
+
+and from *Default & Recovery Database – Technical Specification*
+
+> Moody's Default & Recovery Database (DRD) contains the following data for 
+550,000 debts and 60,000 global sovereigns and corporate entities, including 
+Real Estate, Insurance, and Financial Institutions. The data is updated
+monthly and spans from 1970 to present, with select data going back to 1920. 
+>
+> ...
+> 
+> Each month, this team researches the financial markets, publications, and 
+publically filed documents to identify any defaults that have occurred over the 
+previous 30 days and add them to the database. Where available, recovery 
+pricing is sourced from external vendors and added to the database. 
+Occasionally the researchers will identify new information about historical 
+defaults and will add this to the database, resulting in historical changes. 
+
+## MASTER_ISSR table
+
+We look further at the `MASTER_ISSR` table. It contains information about each 
+of the firms. The primary identifier is the:
+
+> MAST_ISSR_NUM: Unique identifer of the issuer. Additional information on this 
+issuer, such as name and industry, can be found using the ISSUER_NAM and 
+MOODYS_35_ CODE felds
+
+```{r check_MASTER_ISSR}
+options(stringsAsFactors = F)
+issuer_tbl <- sqlFetch(db_con, "MAST_ISSR")
+nrow(issuer_tbl)
+str(issuer_tbl)
+
+# The firm identifier
+head(issuer_tbl$MAST_ISSR_NUM, 15)
+stopifnot(!anyDuplicated(issuer_tbl$MAST_ISSR_NUM))
+
+# Names of the firms
+head(issuer_tbl$ISSUER_NAM, 15)
+
+# they are not unique...
+stopifnot(anyDuplicated(issuer_tbl$ISSUER_NAM) > 0)
+
+# SIC code
+head(issuer_tbl[, c("MOODYS_11_CODE", "SIC_CODE_CD", "SIC_CODE_SPEC_CD")], 15)
+local({
+  # all firms have both codes or none
+  x <- is.na(as.matrix(issuer_tbl[, c("SIC_CODE_CD", "SIC_CODE_SPEC_CD")]))
+  stopifnot(all(x[, 1] == x[, 2]))
+})
+```
+
+# GOVT_DOMAIN table
+
+We look at the domicile of the firms. This information is in the `GOVT_DOMAIN` 
+table. It is a table which contains
+
+> Location mapping which corresponds to the domain number found in the 
+MDY_DOMN_NUM field in MAST_ISSR.
+
+It needs to be joined by the `MDY_DOMN_NUM` to the `MASTER_ISSR` table.
+
+```{r gov_tbl}
+govt_domain <- sqlFetch(db_con, "GOVT_DOMAIN")
+str(govt_domain)
+
+head(govt_domain$DOMN_NAM)      # Place
+unique(govt_domain$DOMN_TYP_CD) # Type of place (city, country etc.)
+unique(govt_domain$REGN_CD)     # Region
+
+# This can be mapped against the 'MDY_DOMN_NUM' variable
+head(issuer_tbl$MDY_DOMN_NUM, 15)
+
+# some are missing. Not sure what this implies?
+stopifnot(anyNA(issuer_tbl$MDY_DOMN_NUM))
+
+# we make a left join
+issuer_tbl <- merge(
+  issuer_tbl, govt_domain[, c("MDY_DOMN_NUM", "DOMN_TYP_CD", "DOMN_ABBR",
+                              "DOMN_NAM", "REGN_CD")], 
+  by = "MDY_DOMN_NUM", all.x = TRUE)
+```
+
+# ISSR_IDS table
+
+The `ISSR_IDS` table can be used to map against external databases. It 
+
+> Links Moody’s Issuer Number to one or more identifers external to this 
+database (such as Moodys.com identifers, tickers, and Base CUSIPs), where 
+available.
+
+In particular: 
+
+> ISSR_ID_NUM: Code identifying what type of entity identifier is shown 
+ISSR_ID, e.g. RTG (Rating Agency Id), BLO (Ticker) & CUS (Base CUSIP). Can be 
+translated using the LOOKUP table
+
+> ISSR_ID: Entity Identifiers External to this database such as Moodys.com 
+identifiers, tickers ,and Base CUSIPs (1st six CUSIP digits, issuer-specific).
+
+```{r get_issr_ids}
+issr_ids <- sqlQuery(
+  db_con, "
+  select a.MAST_ISSR_NUM, 
+    a.ISSR_ID, 
+    b.FIELD_TXT as type
+  from issr_ids as a
+  left join (select * from lookup where field_nam = 'issr_id_num') as b 
+  on a.ISSR_ID_NUM = b.FIELD_CD")
+```
+
+Note there is multiple map to external databases per firm. 
+
+```{r get_issr_ids_match_mult_map}
+xtabs(~ tapply(MAST_ISSR_NUM, MAST_ISSR_NUM, length), issr_ids)
+xtabs(~ tapply(type, MAST_ISSR_NUM, function(x) length(unique(x))), 
+      issr_ids)
+```
+
+Thus, we reduce it to a single string value which we can use later. It will in 
+the format of `"'<ISSR_ID_num1>':'<value1>';'<ISSR_ID_num2>':'<value2>'..."`
+:
+
+```{r make_external_map}
+external_db_map <- by(
+  issr_ids, issr_ids$MAST_ISSR_NUM, function(cur_rows){
+    # Return a single string value
+    paste0("'", cur_rows$type, "':'", cur_rows$ISSR_ID, "'", 
+           collapse = "; ")
+  }, simplify = FALSE)
+
+external_db_map <- do.call(c, external_db_map)
+external_db_map <- data.frame(
+  MAST_ISSR_NUM = as.integer(names(external_db_map)), 
+  external_maps = unname(external_db_map))
+
+# Print the first values
+head(external_db_map, 10)
+```
+
+We join it to the table we work with 
+
+```{r join_external_tbl}
+# we have a match for all firms
+stopifnot(all(issuer_tbl$MAST_ISSR_NUM %in% external_db_map$MAST_ISSR_NUM))
+issuer_tbl <- merge(issuer_tbl, external_db_map, by = "MAST_ISSR_NUM")
+```
+
+## MAST_ISSU 
+The `MAST_ISSU` table 
+
+> stores descriptive debt details of each issue in the data set including 
+coupon rate, currency, maturity, etc.
+
+It is not clear when people include firms in their sample. @Chava11
+
+> ... restrict [their] attention to only those firms that are in the intersection  
+of Moody's URD, CRSP, and COMPUSTAT databases during 1980-2008. The COMPUSTAT 
+(active and research) files for this period provide the firm level balance 
+sheet data, and CRSP provides the market data. The sample includes 3,555 firms, 
+46,605 firm-years, and 477 defaults. 
+
+@Duffie07 include a firm in their data set 
+
+> ... provided it has a common firm identifier for the Moodys and 
+Compustat databases, and is of the Moodys ‘‘Industrial’’ category. We also
+restrict attention to firms for which we have at least 6 months of monthly 
+Compustat data. We are left with 2,770 firms, covering 392,404 firm-months of 
+data.
+
+@Lando10 sample
+
+> ... is based on corporate default data from Moody’s 
+Default Risk Service Database (DRSD), which essentially covers the period since 
+1970. However, the material is sparse until 1982, which we therefore choose as 
+the beginning of our sample period... We have chosen to rely only on the data 
+in Moody’s database since here there are explanatory notes associated with each 
+default, allowing us to both screen the default histories for traces of 
+contagion and for parent–subsidiary relationships. It also has the advantage 
+of giving us an unambiguous definition of what constitutes a default event.
+> 
+> Thus our estimation will comprise all US industrial firms with a debt issue 
+registered in Moody’s DRSD, and for which we are able to obtain accompanying 
+stock market data from CRSP and accounting information from CompuStat. For 
+the period January 1982 to December 2005 this leaves us with a total of 2557 
+firms comprising 370 defaults, with an average of 1142 and a minimum of 1007 
+firms in the model at any time throughout the sample period, all of which have 
+at least 6 months of available data.
+
+I guess this could mean a firm is included when it has
+
+1. issues in the Moody's database but only when they have an active issue in 
+a given period. 
+2. issues in the Moody's database.
+
+Number 2. would be problematic if Moody's only track issuers while they have a 
+debt obligation. See the comments and the end for more on this issue.
+
+<div class="hideable">
+
+```{r get_mast_issu}
+sqlQuery(db_con, "select count(*) from mast_issu") # number of rows
+mast_issu <- sqlQuery(
+  db_con,
+  # you need to nest joins in Access sql... 
+  # See https://stackoverflow.com/a/10852571/5861244
+  "select a.mast_issu_num, 
+     a.mast_issr_num, 
+     a.sale_datetime, 
+     a.matr_datetime,       
+     a.debt_type, 
+     c.field_txt as debt_class
+   from (select 
+     mast_issu.*, b.field_txt as debt_type
+     from mast_issu
+     left join (select * from lookup where field_nam = 'debt_typ_cd') as b 
+     on b.field_cd = mast_issu.debt_typ_cd) as a
+   left join (select * from lookup where field_nam = 'debt_class_cd') as c 
+   on c.field_cd = a.debt_class_cd")
+nrow(mast_issu)
+
+# issuer number
+stopifnot(all(mast_issu$mast_issr_num %in% issuer_tbl$MAST_ISSR_NUM))
+
+# issue number. one-to-many and unique
+stopifnot(!anyDuplicated(mast_issu$mast_issu_num))
+tmp <- xtabs(~ tapply(mast_issu_num, mast_issr_num, length), mast_issu)
+head(tmp, 25)
+max(tmp)
+stopifnot(
+  all(with(mast_issu, tapply(mast_issr_num, mast_issu_num, length) == 1)))
+
+# debt type      Descirption of the debt obligation; more specific than debt 
+#                debt class
+# debt class     Broad desciption of the obligationer
+# sales date     Day of which the istrument was issued
+# maturity date
+tail(sort(xtabs(~ mast_issu$debt_class)), 25)
+
+# some are missing 
+with(mast_issu, mean(is.na(sale_datetime) & is.na(matr_datetime)))
+
+# it is class specific 
+tmp <- do.call(rbind, with(mast_issu, tapply(
+  is.na(sale_datetime) | is.na(matr_datetime), debt_class, 
+  function(x) c(n = length(x), `frac missig` = mean(x)))))
+tail(tmp[order(tmp[, 1]), ], 25)
+
+stopifnot(any(
+  !with(subset(mast_issu, !is.na(sale_datetime) & !is.na(matr_datetime)), 
+               sale_datetime <  matr_datetime)))
+stopifnot(all(
+  with(subset(mast_issu, !is.na(sale_datetime) & !is.na(matr_datetime)), 
+              sale_datetime <= matr_datetime)))
+
+# Specification of DRD on moodys.com doesn't mention what NaN-cases refer to
+# We have tried to ask them...
+```
+
+</div>
+
+For each firm, we find the first non-`NA` sales date. Then we can include them 
+from this point forward? 
+
+```{r find_min_sales}
+library(data.table)
+mast_issu <- data.table(mast_issu)
+mast_issu[
+  , `:=`(
+    min_sale = if(any(!is.na(sale_datetime))) 
+      min(sale_datetime, na.rm = TRUE) else NA_real_,
+    max_matr = if(any(!is.na(matr_datetime)))
+      max(matr_datetime, na.rm = TRUE) else NA_real_),
+  by = mast_issr_num]
+tmp <- mast_issu[
+  , .(min_sale = first(min_sale), max_matr = first(max_matr)), 
+  by = mast_issr_num]
+mean(!is.na(tmp$min_sale))
+mean(!is.na(tmp$max_matr))
+
+issuer_tbl <- merge(issuer_tbl, tmp, by.x = "MAST_ISSR_NUM", 
+                    by.y = "mast_issr_num", all.x = TRUE)
+```
+
+Check for holes in `sales-datetime` and `matr-datetime` when they are non-`NA`
+
+```{r check_holes}
+library(data.table)
+local({
+  cat("There are", length(unique(mast_issu$mast_issr_num)), 
+      "firms to start with\n")
+  
+  mast_issu_trm <- mast_issu[
+    , .(mast_issr_num, sale_datetime, matr_datetime)][
+      , is_complete  := !is.na(sale_datetime) & !is.na(matr_datetime)][
+        is_complete == TRUE]
+  
+  cat(length(unique(mast_issu_trm$mast_issr_num)), "has an issue with a", 
+      "maturity and sales date\n")
+  
+  setkey(mast_issu_trm, mast_issr_num, sale_datetime) # sort
+  mast_issu_trm[, n_issues := .N, by = mast_issr_num]
+  
+  cap <- 25L
+  cat("Distribution of number of complete issues (capped at ", 
+      cap, ")\n", sep = "")
+  print(table(mast_issu_trm[, min(first(n_issues), cap), 
+                            by = mast_issr_num][[2L]]))
+  
+  frac_ones <- mean(
+    mast_issu_trm[, first(n_issues), by = mast_issr_num]$V1 < 2L)
+  mast_issu_trm <- mast_issu_trm[n_issues > 1L][
+    , `:=`(
+      sale_lead = as.double(shift(sale_datetime, type = "lead")),
+      max_atr = cummax(as.double(matr_datetime))), by  = mast_issr_num]
+  
+  is_covered <- mast_issu_trm[, all(sale_lead[-.N] <= max_atr[-.N]), 
+                              by = mast_issr_num]
+  
+  cat("Of those with more then one complete issue", 
+      (frac_cov <- mean(is_covered[[2L]])) * 100, 
+      "pct. has overlapping periods with debt or", 
+      (frac_ones + (1 - frac_ones) * frac_cov) * 100,
+      "pct. of all firm with atleast one issue\n")
+})
+```
+
+# Senior Ratings
+
+The `Senior Ratings` table
+
+> ... stores the issuer-level estimated senior unsecured rating & history 
+for issuers of long term debt, specially formatted and filtered for default rate 
+and rating migration calculations.
+
+Since
+
+>  Coverage includes (Moody’s Investors Service) rated entities, rated 
+defaulters, and unrated defaulters back to 1980 for EMEA, 1920 for the US, 
+and the 1990’s for Asia. 
+
+then it is not clear whether we could be "fine" by just looking at firms when 
+they are rated. We will need the following variables 
+
+> `RATG_DATETIME`: Effective date of Moody's rating, found in `EST_SENR_RTG_TXT`. 
+Active until the rating Expiration date (`RATG_EXPIRE_DATETIME`).
+> 
+> `RATG_EXPIRE_DATETIME`: Date `EST_SENR_RTG_TXT` is no longer in force, either 
+because of a rating change or withdrawal; ratings current as of the 
+file-creation date will have a blank in this field.
+>
+> `TERM_DATETIME`: When `censor` is '0' this is the date the company went into 
+default. When censor is '1' this indicates the last update date of the senior 
+rating. Only related to the censor column, `TERM_DATETIME` does not correspond 
+with other columns in this table
+
+It may be important to note that
+
+> Example: If there is a given entity classified as a finance company (with 
+qualifying debt), it will have a Senior Unsecured or Equivalent Rating. 
+However, if that company acquires several other companies, and moves
+operations and assets out, it may be re-categorized as a holding company. 
+Holding companies do not qualify for Senior Unsecured Ratings (subject to 
+change without notice). In this case that same entity would no longer qualify 
+for a Senior Unsecured or Equivalent rating and would be removed entirely, 
+including its history. This entity would then no longer be included in our 
+default research, default rates, rating transitions, nor Default & Recovery 
+Database rating history.
+
+and 
+
+> Withdrawn - WR
+>
+> When Moody’s no longer rates an obligation on which it
+previously maintained a rating, the symbol WR is employed.
+Please see Moody’s Guidelines for the Withdrawal of Ratings,
+available on www.moodys.com
+
+We load in the data
+
+```{r load_senior_rate}
+sen_rate <- sqlQuery(
+  db_con,
+  "select MAST_ISSR_NUM, MAST_ISSU_NUM, CENSOR, RATG_DATETIME, 
+      RATG_EXPIRE_DATETIME, TERM_DATETIME, EST_SENR_RTG_TXT
+   from SENR_RATG_STANDARD")
+nrow(sen_rate)
+
+# what is the coverage of issuers
+mean(issuer_tbl$MAST_ISSR_NUM %in% sen_rate$MAST_ISSR_NUM)
+
+# mean number of rows per issuer
+with(sen_rate, mean(tapply(MAST_ISSR_NUM, MAST_ISSR_NUM, length)))
+
+# checks
+library(data.table)
+sen_rate <- data.table(sen_rate)
+stopifnot(
+  all(!is.na(sen_rate$RATG_DATETIME)), all(!is.na(sen_rate$TERM_DATETIME)),
+  anyNA(sen_rate$RATG_EXPIRE_DATETIME), 
+  # not unique
+  any(sen_rate[, length(unique(TERM_DATETIME)), by = MAST_ISSR_NUM]$V1 > 1L),
+  sen_rate[!is.na(RATG_EXPIRE_DATETIME), RATG_DATETIME < RATG_EXPIRE_DATETIME])
+
+# one issue is that the `RATG_EXPIRE_DATETIME` are missing at all sorts of 
+# starting points...
+hist(as.Date(sen_rate[is.na(RATG_EXPIRE_DATETIME), RATG_DATETIME]),
+     breaks = seq.Date(
+       as.Date(min(sen_rate$RATG_DATETIME)), 
+       as.Date(max(sen_rate$RATG_DATETIME)), 
+       length.out = 25))
+
+# which rating ends when
+with(subset(sen_rate, is.na(RATG_EXPIRE_DATETIME)), {
+  mea <- tapply(RATG_DATETIME, EST_SENR_RTG_TXT, mean)
+  xsq <- tapply(RATG_DATETIME, EST_SENR_RTG_TXT, quantile, prob = .01)
+  xlq <- tapply(RATG_DATETIME, EST_SENR_RTG_TXT, quantile, prob = .05)
+  xsd <- tapply(RATG_DATETIME, EST_SENR_RTG_TXT, sd)
+  nob <- tapply(RATG_DATETIME, EST_SENR_RTG_TXT, length)
+  
+  xsd <- as.difftime(xsd, units = "secs")
+  
+  data.frame(
+    `# observations` = nob, 
+    mean = as.POSIXct(mea, origin = "1970-01-01"),
+    `1%`  = as.POSIXct(xsq, origin = "1970-01-01"),
+    `5%`  = as.POSIXct(xlq, origin = "1970-01-01"),
+    `sd (days)` = as.numeric(xsd, units = "days"), 
+    check.names = FALSE)[order(mea), ]
+})
+
+# when does `TERM_DATETIME` fall after `RATG_DATETIME` when the issuer 
+# has not been withdrawn?
+mean(sen_rate[is.na(RATG_EXPIRE_DATETIME) & EST_SENR_RTG_TXT != "WR", 
+              RATG_DATETIME < TERM_DATETIME])
+
+# are all the withdrawn ones at the end?
+setkey(sen_rate, MAST_ISSR_NUM, RATG_DATETIME)
+sen_rate[, `:=`(is_last = 1:.N == .N, max_RATG_DATETIME = max(RATG_DATETIME)), 
+         by = MAST_ISSR_NUM]
+with(subset(sen_rate[EST_SENR_RTG_TXT == "WR"]), 
+     table(`is withdrawn at the end` = is_last, CENSOR))
+
+# mean distance between start time of withdrawn to last observed time (days)
+quantile(
+  sen_rate[EST_SENR_RTG_TXT == "WR" & !is_last,
+           RATG_DATETIME - max_RATG_DATETIME], seq(0, 1, by = .1))
+
+# length of intermediary WR periods (days)
+quantile(sen_rate[EST_SENR_RTG_TXT == "WR" & !is_last, 
+                  RATG_EXPIRE_DATETIME - RATG_DATETIME], seq(0, 1, by = .1))
+
+# insert current date when it is not a WR at the end
+mean(is.na(sen_rate$RATG_EXPIRE_DATETIME))
+sen_rate[EST_SENR_RTG_TXT != "WR" & is.na(RATG_EXPIRE_DATETIME), 
+         RATG_EXPIRE_DATETIME := Sys.time()]
+mean(is.na(sen_rate$RATG_EXPIRE_DATETIME))
+```
+
+Create table with periods where an issuer is rated
+
+```{r create_rated_tabel}
+setkey(sen_rate, MAST_ISSR_NUM, RATG_DATETIME)
+
+func <- function(RATG_DATETIME, RATG_EXPIRE_DATETIME){
+  n <- length(RATG_DATETIME)
+  if(n < 2L)
+    list(p_start = RATG_DATETIME, p_stop = RATG_EXPIRE_DATETIME, 
+         p_stop_non_NA = RATG_EXPIRE_DATETIME)
+  
+  p_stop_non_NA <- p_stop <- p_start <- .POSIXct(rep(NA_real_, n))
+  p_start[1] <- RATG_DATETIME[1]
+  p_stop_non_NA[1] <- p_stop[1]  <- RATG_EXPIRE_DATETIME[1]
+  
+  j <- 1L
+  for(i in seq_len(n - 1L) + 1L){
+    if(RATG_DATETIME[i] <= p_stop[j]){
+      # just extend the stop time
+      is_na <- is.na(RATG_EXPIRE_DATETIME[i])
+      if(!is_na & RATG_EXPIRE_DATETIME[i] < p_stop[j])
+        stop("something is wrong")
+      p_stop[j] <- RATG_EXPIRE_DATETIME[i]
+      if(!is_na)
+        p_stop_non_NA[j] <- RATG_EXPIRE_DATETIME[i]
+        
+      next
+    }
+    
+    # add a new row
+    j <- j + 1L
+    p_start[j] <- RATG_DATETIME[i]
+    p_stop_non_NA[j] <- p_stop[j]  <- RATG_EXPIRE_DATETIME[i]
+  } 
+  
+  list(p_start = p_start[1:j], p_stop = p_stop[1:j], 
+       p_stop_non_NA = p_stop_non_NA[1:j])
+}
+func <- compiler::cmpfun(func)
+
+rated_tbl <- sen_rate[
+  , func(RATG_DATETIME, RATG_EXPIRE_DATETIME), by = MAST_ISSR_NUM]
+```
+
+Check result
+
+```{r check_create_rated_tabel}
+stopifnot(
+  all(sen_rate$MAST_ISSR_NUM %in% rated_tbl$MAST_ISSR_NUM),
+  all(
+    sen_rate[, min(RATG_DATETIME), by = MAST_ISSR_NUM]$V1 == 
+      rated_tbl[, min(p_start), by = MAST_ISSR_NUM]$V1), 
+  max(rated_tbl[, .N, by = MAST_ISSR_NUM]$N) == 1L, 
+  # should hold if we get one row for each issuer
+  all(sen_rate[
+    , is.na(RATG_EXPIRE_DATETIME[-.N]) | 
+      RATG_EXPIRE_DATETIME[-.N] == RATG_DATETIME[-1], 
+    by = MAST_ISSR_NUM]$V1))
+
+local({
+  tmp <- merge(sen_rate, rated_tbl[, .(MAST_ISSR_NUM, p_stop_non_NA)])
+  tmp[, all_na := all(is.na(RATG_EXPIRE_DATETIME)), by = MAST_ISSR_NUM]
+  stopifnot(all(tmp[, all_na == is.na(p_stop_non_NA)]))
+  
+  tmp <- tmp[all_na == FALSE]
+  stopifnot(all(tmp[, p_stop_non_NA == max(RATG_EXPIRE_DATETIME, na.rm = TRUE), 
+                    by = MAST_ISSR_NUM]$V1))
+})
+```
+
+# MAST_DFLT Table
+
+`MAST_DFLT` has master default data about the period of defaults
+
+```{r def_table}
+# Master Default data
+default_master <- sqlFetch(db_con, "mast_dflt")
+
+# Default number
+# Unique for every default period
+stopifnot(all(
+  with(default_master, tapply(MAST_ISSR_NUM, DEF_NUM, length)) == 1))
+stopifnot(any(
+  with(default_master, tapply(DEF_NUM, MAST_ISSR_NUM, length)) > 1))
+
+# we have a lot of firms with no defaults
+mean(issuer_tbl$MAST_ISSR_NUM %in% default_master$MAST_ISSR_NUM)
+
+# description of the default event
+cat(substr(default_master$BLURB[1], 1, 100), "...\n", sep = "")
+```
+
+We got three types of dates
+
+```{r def_table_dates}
+# BANKRUPTCY_DATETIME         Date the company field for bankrupcty, if any
+#                             during this period.
+# BANKRUPTCY_DEF_DATETIME     Obligor default date at time of bankrupcty or 
+#                             restructuring, used for ultimate recovery 
+#                             calculations.
+# RATING_AGENCY_DEF_DATETIME  Initial date this issuer went into default as 
+#                             determined by Moody's
+def_date_cols <- c("BANKRUPTCY_DATETIME", "BANKRUPTCY_DEF_DATETIME", 
+                   "RATING_AGENCY_DEF_DATETIME")
+head(default_master[, def_date_cols], 10)
+sapply(default_master[, def_date_cols], function(x) mean(is.na(x)))
+```
+
+The reason that `BANKRUPTCY_DATETIME` has missing values is (likely) that 
+Moody's takes a broader default definition then bankruptcy fillings. This can 
+be seen from the 
+
+```{r def_types}
+# BANKRUPTCY_TYP_CD  Type of bankrupcty the company filed for, if any
+# DEF_TYP_CD         Brief descirption of the default period
+def_cols <- c("BANKRUPTCY_TYP_CD", "DEF_TYP_CD")
+head(default_master[, def_cols], 10)
+with(default_master, 
+     stopifnot(all(is.na(BANKRUPTCY_DATETIME) == is.na(BANKRUPTCY_TYP_CD))))
+```
+
+It seems to be quite common to use a broad definition of default. E.g., 
+@Duffie07 use
+
+> The reasons for deletion [AFTNT35] are coded 1-10. (Code 2 is bankruptcy under 
+Chapter 11; Code 3 is bankruptcy under Chapter 7.)
+> 
+> ...
+> 
+> Bankruptcy. An exit is treated for our purposes as a bankruptcy if coded in 
+Moodys database under any of the following categories of events: Bankruptcy, 
+Bankruptcy Section 77, Chapter 10, 12 Chapter 11, Chapter 7, and Prepackaged 
+Chapter 11. A bankruptcy is also recorded if data item AFTNT35 of Compustat is 2 
+or 3 (for Chapter 11 and Chapter 7, respectively). In some cases, our data 
+reflect bankruptcy exits based on information from Bloomberg and other data 
+sources. Our data set has 175 bankruptcy exits, although many defaults that 
+eventually led to bankruptcies may not appear as bankruptcy exits if the 
+default was triggered earlier than the bankruptcy, for example by a missed 
+debt payment.
+> 
+> Default. A default is defined as a bankruptcy, as above, or as any of the 
+following additional default types in the Moodys database: distressed exchange, 
+dividend omission, grace-period default, indenture modified, missed interest 
+payment, missed principal and interest payments, missed principal payment, 
+payment moratorium, suspension of payments. We also include any defaults 
+recorded in Bloomberg or other data sources.
+
+I find the part AFTNT35 code 3 is problematic. Code 3 is liquidation (not bankruptcy under Chapter 7) and I 
+asked S&P global what this may include. An employee told me 
+
+> Code 2: This code is used when a company files for Chapter 7 bankruptcy. The 
+company is deactivated the following month and Standard & Poor's uses various 
+SEC filings to confirm the bankruptcy. Code 3: This code is used when a company 
+is liquidating outside of bankruptcy. It can be difficult to determine if a 
+company is liquidating through bankruptcy or not because filings are not always 
+easily found for companies in this situation. In those cases, the Researcher 
+uses their judgment. Code 3 doesn’t necessarily mean that the company has filed 
+Chapter 11 bankruptcy. The company status remains active until plan to 
+reorganize fails (e.g. Enron Corp.). Unfortunately, there aren’t any data items 
+within the database that specifically note that a company has filed Chapter 11.
+
+So whilst including code 2 makes sense then I do not think code 3 should be 
+included. However, it is quite commonly done in the literature. It is 
+not done in some paper like @Chava11 who
+
+> use Moody's definition of default in our analysis. Moody's defines default 
+as the event in which one or more of the following happen: (a) there is a 
+missed or delayed disbursement of interest and/or principal, including delayed 
+payments made within a grace period; (b) the company files for bankruptcy, 
+administration, legal receivership, or other legal blocks to the timely payment 
+of interest or principal; (c) a distressed exchange takes place. This happens 
+either when the exchange has the apparent purpose of helping the borrower avoid 
+default or when the issuer offers bondholders a new security or a package of
+securities that represents a diminished financial obligation (such as preferred 
+or common stock, or debt with a lower coupon or par amount, lower seniority,
+or longer maturity).
+
+Another paper where only Moody's is used is @Lando10 who
+
+> ... consider as a default any of the following events classified in Moody’s 
+DRSD: Chapter 7, Chapter 11, Distressed, exchange, Grace period default, 
+Missed interest payment, Missed principal payment, Missed principal and 
+interest payments, Prepackaged Chapter 11, and Suspension of payments. In 
+particular, we do not correct the timing of a Distressed exchange, which in the 
+DRSD is registered as the time of completion of the exchange, although as 
+suggested by Davydenko (2007), it would probably be more appropriate to 
+instead collect separate information on the announcement date of the exchange.
+
+Common is that they all use most (all?) of the default types
+
+```{r DEF_TYP_CD}
+sort(xtabs(~ default_master$DEF_TYP_CD))
+```
+
+E.g., we can look at intersection of @Lando13 and @Duffie07
+
+```{r excl_event_intersection}
+lando_nielsen_2010 <- c(
+  "Chapter 7", "Chapter 11", "Distressed exchange", "Grace period default", 
+  "Missed interest payment", "Missed principal payment", "Missed principal and interest payments", 
+  "Prepackaged Chapter 11", "Suspension of payments")
+
+duffie_saita_wang_2007 <- c(
+  "Bankruptcy", "Bankruptcy, Section 77", "Chapter 10", "Chapter 11", "Chapter 7", "Prepackaged Chapter 11",
+  "Distressed exchange", "Dividend omission", "Grace period default", "Indenture modified", 
+  "Missed interest payment", "Missed principal and interest payments", "Missed principal payment", 
+  "Payment moratorium", "Suspension of payments")
+
+stopifnot(
+  all(lando_nielsen_2010 %in% default_master$DEF_TYP_CD),
+  all(duffie_saita_wang_2007 %in% default_master$DEF_TYP_CD))
+
+intersect(lando_nielsen_2010, duffie_saita_wang_2007)
+setdiff(duffie_saita_wang_2007, lando_nielsen_2010)
+```
+
+We only include some
+
+```{r excl_event}
+keep <- duffie_saita_wang_2007
+
+# Dropping the following default types
+setdiff(default_master$DEF_TYP_CD, keep)
+
+nrow(default_master) # n obs before
+default_master <- subset(default_master, DEF_TYP_CD %in% keep)
+nrow(default_master) # n obs after
+```
+
+We may ask which types of debt that defaults in Moody's
+
+```{r debt_default_typ}
+local({
+  default_issues <- sqlFetch(db_con, "dflt_issu")
+  stopifnot(
+    # there may be more issues with a default event
+    any(with(
+      default_issues, 
+      tapply(MAST_ISSU_NUM, DEF_NUM, function(x) length(unique(x)))) > 1))
+  library(data.table)
+  default_issues <- data.table(default_issues)[
+    , .(MAST_ISSU_NUM = unique(MAST_ISSU_NUM)), by = DEF_NUM]
+  
+  merged_issues <- merge(default_master[, c("DEF_NUM", "DEF_TYP_CD")], 
+                         default_issues, by = "DEF_NUM")
+  colnames(merged_issues) <- tolower(colnames(merged_issues))
+  
+  merged_issues_mast <- merge(mast_issu[, c("mast_issu_num", "debt_class", 
+                                            "mast_issr_num")], 
+                               merged_issues, 
+                               by = "mast_issu_num", all.x = TRUE)
+  stopifnot(
+    # some have more than one event
+    max(with(
+      merged_issues_mast, tapply(mast_issu_num, mast_issu_num, length))) > 1L)
+  
+  merged_issues_mast <- merged_issues_mast[
+    , .(debt_class = first(debt_class), n_events = sum(!is.na(def_num)), 
+        mast_issr_num = first(mast_issr_num)), 
+    by = mast_issu_num]
+  
+  merged_issues_mast[, .(
+    `# issues` = .N, `# events` = sum(n_events), 
+    `# issuer` = length(unique(mast_issr_num)),
+    `frac any events` = mean(n_events > 0), `event rate` = mean(n_events)), 
+    by = debt_class][`event rate` > 0][order(`# issues`)]
+})
+```
+
+There is an extremely large default rate in some of the classes! 
+The final column we need is 
+
+```{r RESOLUTION_DATETIME}
+# RESOLUTION_DATETIME  Date the issuer technically came out of default, if 
+#                      avialable. This is not the date Moody's considers the 
+#                      period of default to over. 
+mean(is.na(default_master$RESOLUTION_DATETIME))
+
+# only some times of default leads to resolution
+tmp <- do.call(rbind, with(
+  default_master, tapply(RESOLUTION_DATETIME, DEF_TYP_CD, function(x)
+  c(n = length(x), `frac missing` = mean(is.na(x))))))
+tmp[order(tmp[, 2]), ]
+```
+
+This is important since 
+
+>  If a company recovers per Moody’s definition, then defaults again, both 
+will be listed in this table.
+
+So we may expect a non-`NA` could make it possible that the firm can default 
+again. Though, I guess the following should be stressed
+
+> This is not the date Moody's considers the period of default to over. 
+
+It is not at clear what some people do with recovering firms. 
+We have a sizable number of firms that do recover
+
+```{r many_recover}
+mean(!is.na(default_master$RESOLUTION_DATETIME))
+```
+
+Some, a) remove all firms after the first default or b) include some
+period after. We make an event table where which we can use in either case
+
+```{r make_event_tbl}
+library(data.table)
+default_master <- data.table(default_master)
+
+# sort data
+setkey(default_master, MAST_ISSR_NUM, RATING_AGENCY_DEF_DATETIME)
+
+# define function to make event table
+source(file.path("R", "ym.R"))
+func <- function(event_time, resolution_date, event){
+  require(lubridate)
+  n <- length(event_time)
+  status <- rep(NA_character_, n * 2L)
+  ev_type <- rep(NA_character_, n * 2L)
+  status_start <-  .POSIXct(rep(NA_real_, 2L * n))
+  j <- 0L
+  for(i in seq_len(n)){
+    ev <- event_time[i]
+    re <- resolution_date[i]
+    
+    # make a guess that the issue is resolved one year after if nothing is 
+    # stated
+    ne_time <- if(is.na(re))
+      ev %m+% base::months(12L) else re
+    
+    if(i == 1L){
+      # first row. Just add two statuses
+      j <- j + 1L
+      status[j] <- "default"
+      status_start[j] <- ev
+      ev_type[j] <- event[i]
+      j <- j + 1L
+      status[j] <- "maybe normal"
+      status_start[j] <- ne_time
+      next
+    }
+    
+    if(make_ym(ev) - make_ym(status_start[j]) > 0L){
+      # we add a new event since it comes after the last is resolved
+      j <- j + 1L
+      status[j] <- "default"
+      status_start[j] <- ev
+      ev_type[j] <- event[i]
+      j <- j + 1L
+      status[j] <- "maybe normal"
+      status_start[j] <- ne_time
+      next
+    }
+    
+    # we adjust the status_start time
+    ev_type[j - 1L] <- paste0(ev_type[j - 1L], ":", event[i])
+    status_start[j] <- max(ne_time, status_start[j])
+  }
+  
+  keep <- !is.na(status)
+  
+  stopifnot(
+    all(!is.na(as.double(status_start)) == keep), which(keep) == seq_len(sum(keep)))
+  
+  status       <-       status[keep]
+  status_start <- status_start[keep] 
+  ev_type      <- ev_type[keep]
+  is_first     <- logical(length(status))
+  is_first[1L] <- TRUE
+  list(status = status, status_start = status_start, is_first = is_first, 
+       ev_type = ev_type)
+}
+func <- compiler::cmpfun(func)
+
+# make table
+event_tbl <- default_master[
+  , func(RATING_AGENCY_DEF_DATETIME, RESOLUTION_DATETIME, DEF_TYP_CD), 
+  by = MAST_ISSR_NUM]
+nrow(event_tbl)
+head(event_tbl)
+
+# # run to check manually
+# tmp <- sample(unique(default_master$MAST_ISSR_NUM), 20)
+# View(default_master[
+#   MAST_ISSR_NUM %in% tmp, 
+#   .(MAST_ISSR_NUM, RATING_AGENCY_DEF_DATETIME, DEF_TYP_CD, RESOLUTION_DATETIME,
+#     RESOLUTION_TYP, BLURB)])
+# View(event_tbl[MAST_ISSR_NUM %in% tmp])
+```
+
+We can use the `is_first` flag in case we want to exclude firms after the 
+first default event. How many have repeating events?
+
+```{r chech_n_repeat}
+mean(event_tbl[, sum(status == "default"), by = MAST_ISSR_NUM]$V1 > 1)
+```
+
+## Checks and add periods to include a firm
+
+Plots number of events versus time
+
+<div class="hideable">
+
+```{r events_vs_time, cache = TRUE, cache.extra = digest::digest(as.data.frame(event_tbl))}
+local({
+  #####
+  # all events
+  stopifnot(!anyNA(default_master$RATING_AGENCY_DEF_DATETIME))
+  
+  tmp <- copy(default_master)
+  tmp <- tmp[, ym := make_ym(RATING_AGENCY_DEF_DATETIME)][
+    , .(`Number of events` = .N), by = ym][, date := make_ym_inv(ym)]
+  
+  #####
+  # only included events
+  tmp_inc <- copy(event_tbl)
+  tmp_inc <- tmp_inc[, ym := make_ym(status_start)][status == "default"][
+    , .(`Number of events` = .N), by = ym][, date := make_ym_inv(ym)]
+  
+  #####
+  # merge and compute diff
+  tmp_mer <- merge(
+    tmp    [, .(ym, ev_all = `Number of events`)], 
+    tmp_inc[, .(ym, ev_inc = `Number of events`)], all = TRUE)[
+      , `:=`(diff = ifelse(is.na(ev_all), 0, ev_all) - 
+               ifelse(is.na(ev_inc), 0, ev_inc),
+             date = make_ym_inv(ym))]
+  
+  #####
+  # plot
+  par(mar = c(5, 4, .5, .25))
+  col <- rgb(0, 0, 0, .5)
+  col_inc <- rgb(255, 140, 0, 255/2, maxColorValue = 255)
+  with(tmp, plot(`Number of events` ~ date, type = "h", col = col))
+  with(tmp_inc, segments(
+    date, rep(0, length(date)), date, `Number of events`, col = col_inc))
+  
+  with(subset(tmp, date >= as.Date("1979-12-31")), 
+       plot(`Number of events` ~ date, type = "h", col = col))
+  with(subset(tmp_inc, date >= as.Date("1979-12-31")), segments(
+    date, rep(0, length(date)), date, `Number of events`, col = col_inc))
+  
+  with(subset(tmp_mer, date >= as.Date("1979-12-31")),
+       plot(diff ~ date, type = "h"))
+})
+```
+
+</div>
+
+Only for US firms
+
+<div class="hideable">
+
+```{r US_firm_events_vs_time, cache = TRUE, cache.extra = digest::digest(as.data.frame(event_tbl))}
+local({
+  #####
+  # all events
+  stopifnot(!anyNA(default_master$RATING_AGENCY_DEF_DATETIME))
+  
+  tmp <- merge(
+    default_master, subset(issuer_tbl, !is.na(REGN_CD) & REGN_CD == "AMR", 
+                           c(MAST_ISSR_NUM)), by = "MAST_ISSR_NUM")
+  tmp <- tmp[, ym := make_ym(RATING_AGENCY_DEF_DATETIME)][
+    , .(`Number of events` = .N), by = ym][, date := make_ym_inv(ym)]
+  
+  
+  #####
+  # only included events
+  stopifnot(!anyDuplicated(issuer_tbl$MAST_ISSR_NUM))
+  tmp_inc <- merge(
+    event_tbl, subset(issuer_tbl, !is.na(REGN_CD) & REGN_CD == "AMR", 
+                      c(MAST_ISSR_NUM)))
+  
+  tmp_inc <- tmp_inc[, ym := make_ym(status_start)][status == "default"][
+    , .(`Number of events` = .N), by = ym][, date := make_ym_inv(ym)]
+  
+  #####
+  # merge and compute diff
+  tmp_mer <- merge(
+    tmp    [, .(ym, ev_all = `Number of events`)], 
+    tmp_inc[, .(ym, ev_inc = `Number of events`)], all = TRUE)[
+      , `:=`(diff = ifelse(is.na(ev_all), 0, ev_all) - 
+               ifelse(is.na(ev_inc), 0, ev_inc),
+             date = make_ym_inv(ym))]
+  
+  #####
+  # plot
+  par(mar = c(5, 4, .5, .5))
+  col <- rgb(0, 0, 0, .5)
+  col_inc <- rgb(255, 140, 0, 255/2, maxColorValue = 255)
+  with(tmp, plot(`Number of events` ~ date, type = "h", col = col))
+  with(tmp_inc, segments(
+    date, rep(0, length(date)), date, `Number of events`, col = col_inc))
+  
+  with(subset(tmp, date >= as.Date("1979-12-31")), 
+       plot(`Number of events` ~ date, type = "h", col = col))
+  with(subset(tmp_inc, date >= as.Date("1979-12-31")), segments(
+    date, rep(0, length(date)), date, `Number of events`, col = col_inc))
+  
+  with(subset(tmp_mer, date >= as.Date("1979-12-31")),
+       plot(diff ~ date, type = "h"))
+})
+```
+
+</div>
+
+How many events fall between the minimum sales date and maximum maturity date
+
+```{r fall_within_min_max}
+local({
+  stopifnot(all(event_tbl$MAST_ISSR_NUM %in% issuer_tbl$MAST_ISSR_NUM), 
+            is.data.table(event_tbl))
+  ev_issue <- merge(
+    event_tbl[status == "default"], issuer_tbl[, c("MAST_ISSR_NUM", "min_sale", 
+                                                   "max_matr")], 
+    by = "MAST_ISSR_NUM")
+  
+  ev_issue[, is_in := !is.na(min_sale) & !is.na(max_matr)]
+  cat(mean(!ev_issue$is_in) * 100, " pct. (", sum(!ev_issue$is_in), 
+      " events)", 
+      " of the events have no sales date or maturity date\n", sep = "")
+  
+  ev_issue[
+    , is_covered := is_in & 
+      make_ym(min_sale) <= make_ym(status_start) &
+      make_ym(status_start) <= make_ym(max_matr)]
+  
+  cat(
+    "Of those that remain ", mean(ev_issue[is_in == TRUE]$is_covered) * 100, 
+    " pct. (", sum(ev_issue[is_in == TRUE]$is_covered), " events) falls", 
+    " within the minimum sale date and the maximum maturity date\n", 
+    sep = "")
+  
+  ev_issue[
+    , .(`# firms` = length(unique(MAST_ISSR_NUM)), `# events` = .N), 
+    by = .(is_in, is_covered)]
+})
+```
+
+What about between the period where they are rated?
+
+<div class="hideable">
+
+Are there default events in periods where a firm is withdrawn?
+
+```{r any_evs_when_wr}
+stopifnot(is.data.table(sen_rate))
+
+local({
+  # the figures here are slightly odd as we do not account for the length of 
+  # the rating period
+  tmp <- merge(sen_rate[EST_SENR_RTG_TXT == "WR"], default_master, 
+               by = "MAST_ISSR_NUM")
+  
+  tmp[, `:=`(
+    after_end = is.na(RATG_EXPIRE_DATETIME) & 
+      RATG_DATETIME < RATING_AGENCY_DEF_DATETIME, 
+    is_between = !is.na(RATG_EXPIRE_DATETIME) &
+      RATG_DATETIME < RATING_AGENCY_DEF_DATETIME & 
+      RATING_AGENCY_DEF_DATETIME <= RATG_EXPIRE_DATETIME)]
+  
+  cat("Distribution of time between withdrawn rating started and the default",
+      "event by whether it is the last period (days)\n")
+  print(with(
+    subset(tmp, after_end | is_between),
+    tapply(RATING_AGENCY_DEF_DATETIME - RATG_DATETIME, after_end, quantile, 
+           probs = seq(0, 1, .1))))
+  
+  cat("Type of events by whether it is the last period\n")
+  print(with(
+    subset(tmp, after_end | is_between), 
+    table(DEF_TYP_CD, after_end, useNA = "ifany")))
+  
+  tmp <- tmp[
+    , .(`is last observation` = is.na(first(RATG_EXPIRE_DATETIME)), 
+        `# events` = sum(after_end) + sum(is_between), 
+        `any events` = sum(after_end) + sum(is_between) > 0), 
+    by = .(MAST_ISSR_NUM, RATG_DATETIME)]
+  
+  cat("Stats for withdrawn rating periods\n")
+  print(o <- with(tmp, table(`is last observation`, `any events`)))
+  print(signif(prop.table(o, margin = 1), 2))
+  
+  cat("\nMean event rate for those with any events by whether it is the last",
+      "observation\n")
+  with(tmp[`any events` == TRUE], tapply(
+    `# events`, `is last observation`, mean))
+})
+```
+
+```{r add_rated_table_data}
+stopifnot(anyDuplicated(rated_tbl$MAST_ISSR_NUM) < 1L)
+setnames(rated_tbl, c("p_start", "p_stop", "p_stop_non_NA"), 
+         c("start_rated", "stop_rated", "stop_rated_non_NA"))
+issuer_tbl <- merge(issuer_tbl, rated_tbl, by = "MAST_ISSR_NUM", all.x = TRUE)
+
+# how many have both a maximum maturity date and first rating date
+with(issuer_tbl, table(
+  `has max matr` = !is.na(max_matr), 
+  `has rating start date` = !is.na(start_rated)))
+
+# when we have an overlap, when is max_matr then relative to the last rating  
+# change date
+mean(with(
+  subset(issuer_tbl, !is.na(stop_rated_non_NA) & !is.na(max_matr)), 
+  stop_rated_non_NA < max_matr))
+
+# what if we add the `TERM_DATETIME` variable
+tmp <- data.table(sen_rate)
+setkey(tmp, MAST_ISSR_NUM, TERM_DATETIME)
+tmp <- tmp[, keep := 1:.N == .N, by = MAST_ISSR_NUM][keep == TRUE, .(
+  MAST_ISSR_NUM, CENSOR, TERM_DATETIME)]
+issuer_tbl <- merge(issuer_tbl, tmp, by = "MAST_ISSR_NUM", all.x = TRUE)
+
+with(subset(issuer_tbl, !is.na(stop_rated_non_NA)), 
+     table(CENSOR, `term time grater` = stop_rated_non_NA < TERM_DATETIME))
+with(subset(issuer_tbl, !is.na(max_matr)), 
+     table(CENSOR, `term time grater` = max_matr < TERM_DATETIME))
+
+# check mean different in original data
+mean(with(subset(sen_rate, !is.na(RATG_EXPIRE_DATETIME)), 
+          RATG_EXPIRE_DATETIME - RATG_DATETIME))
+
+# first insert max maturity when it is greater or the other is missing
+issuer_tbl <- data.table(issuer_tbl)
+issuer_tbl[
+  is.na(stop_rated) &  is.na(stop_rated_non_NA) & !is.na(max_matr) & 
+    start_rated < max_matr, 
+  stop_rated := max_matr]
+mean(is.na(issuer_tbl$stop_rated))
+
+issuer_tbl[
+  is.na(stop_rated) & !is.na(stop_rated_non_NA) & !is.na(max_matr) & 
+    stop_rated_non_NA < max_matr, 
+  stop_rated := max_matr]
+mean(is.na(issuer_tbl$stop_rated))
+
+# for the remaining, we add some months to the latest update time
+library(lubridate)
+issuer_tbl[
+  is.na(stop_rated) & !is.na(stop_rated_non_NA) & is.na(stop_rated), 
+  stop_rated := stop_rated_non_NA %m+% base::months(36L)]
+mean(is.na(issuer_tbl$stop_rated))
+
+# do the same for those with just a start time
+issuer_tbl[
+  is.na(stop_rated) & is.na(stop_rated) & !is.na(start_rated), 
+  stop_rated := start_rated %m+% base::months(36L)]
+mean(is.na(issuer_tbl$stop_rated))
+
+# similar illustration/check as above
+local({
+  stopifnot(all(event_tbl$MAST_ISSR_NUM %in% issuer_tbl$MAST_ISSR_NUM), 
+            is.data.table(event_tbl))
+  ev_issue <- merge(
+    event_tbl[status == "default"], issuer_tbl[, c(
+      "MAST_ISSR_NUM", "start_rated", "stop_rated")], 
+    by = "MAST_ISSR_NUM")
+  
+  ev_issue[, is_in := !is.na(start_rated) & !is.na(stop_rated)]
+  cat(mean(!ev_issue$is_in) * 100, " pct. (", sum(!ev_issue$is_in), 
+      " events)", 
+      " has no period where they are rated\n", sep = "")
+  
+  ev_issue[
+    , is_covered := is_in & 
+      make_ym(start_rated) <= make_ym(status_start) &
+      make_ym(status_start) <= make_ym(stop_rated)]
+  
+  cat(
+    "Of those that remain ", mean(ev_issue[is_in == TRUE]$is_covered) * 100, 
+    " pct. (", sum(ev_issue[is_in == TRUE]$is_covered), " events) falls", 
+    " within the period where they are rated\n", 
+    sep = "")
+  
+  ev_issue[
+    , .(`# firms` = length(unique(MAST_ISSR_NUM)), `# events` = .N), 
+    by = .(is_in, is_covered)]
+})
+```
+
+</div>
+
+
+## Save data
+
+```{r save_tbls}
+colnames(issuer_tbl) <- tolower(colnames(issuer_tbl))
+colnames(event_tbl) <- tolower(colnames(event_tbl))
+
+saveRDS(as.data.frame(issuer_tbl), file.path("data", "moody-issuer.RDS"))
+saveRDS(as.data.frame(event_tbl) , file.path("data", "moody-events.RDS"))
+
+odbcClose(db_con)
+```
+
+
+## References

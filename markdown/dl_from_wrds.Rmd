@@ -1,0 +1,922 @@
+---
+title: "Download data"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:  
+  html_document:
+    toc: true
+bibliography: refs.bib
+---
+
+<script>
+$(document).ready(function(){
+  var hide_divs = $("div.hideable");
+  hide_divs.each(function(){
+    // Wrap content in div
+    $(this).wrapInner( "<div class='hideable_content', style='display: none;'></div>");
+    
+    // Add button
+    $(this).prepend("<button id='toogle'>show</button>");
+  });
+  
+  // Add hideable btn
+  // Put the rest in a div
+  
+  $("div.hideable button#toogle").click(function(){
+    var parent = $(this).parent();
+    var target_div = $(parent).find("div.hideable_content");
+    
+    if(target_div.css("display") == "none"){
+      target_div.show();
+        $(this).text("Hide");
+    } else {
+      target_div.hide();
+      $(this).text("Show");
+    }
+  });
+});
+</script>
+
+```{r setup, include=FALSE, cache=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  fig.height = 4, fig.width = 7, dpi = 128, comment = "#R",
+  cache.path = paste0(file.path("cache", "dl_from_wrds"), .Platform$file.sep), 
+  fig.path   = paste0(file.path("fig"  , "dl_from_wrds"), .Platform$file.sep),
+  error = FALSE)
+options(digits = 4, scipen = 10, width = 70)
+```
+
+
+## Monthly data
+
+The code below gets data from
+
+- [`compm.fundq`](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=130&file_id=66036).
+- [`crsp.msf`](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=137&file_id=67077).
+- [`crsp.Ccmxpf_linktable`](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=137&file_id=66976).
+- [`crsp.msenames`](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=137&file_id=67074).
+
+I found [the following information](https://gist.github.com/iangow/583557b7b91a87ee1e545aa839ccbb8d) on the primary linker
+
+> LINKPRIM clarifies the link's relationship to Compustat's marked primary security within the related range. "P" indicates a primary link marker, as identified by Compustat in monthly security data. "C" indicates a primary link marker, as identified by CRSP to resolve ranges of overlapping or missing primary markers from Compustat in order to produce one primary security throughout the company history. "J" indicates a joiner secondary issue of a company, identified by Compustat in monthly security data.
+
+I also found [this](http://www.kaikaichen.com/?p=138) which is also shown 
+[here](http://www.wrds.us/index.php/forum_wrds/viewthread/609/)
+
+> As of the February 2014 release, USEDFLAG is no longer used in the WRDS CCM web queries.  Please select LINKTYPES LC, LU, and LS for the same results. These represent the vast majority of the links between CRSP securities and Compustat companies, without introducing duplicate data.
+>
+> The WRDS-created linking dataset (ccmxpf_linktable) has been deprecated. It will continue to be created for a transition period of 1 year. SAS programmers should use the Link History dataset (ccmxpf_lnkhist) from CRSP.
+
+Further from the "CRSP/COMPUSTAT merged database guide"
+
+> LNKTYPE: Link type code. Each link is given a code describing the connection 
+> between the CRSP and Compustat data. Values are:
+> 
+> LC – Link research complete. Standard connection between databases
+>
+> LU – Unresearched link to issue by CUSIP
+>
+> LS – Link valid for this security only. Other CRSP PERMNOs with the same 
+> PERMCO will link to other GVKEYs
+> 
+> LINKPRIM: Primary issue marker for the link. Based on
+> Compustat Primary/Joiner flag (PRIMISS), indicating
+> whether this link is to Compustat’s marked primary
+> security during this range. 
+>
+> P = Primary, identified by Compustat in monthly security data.
+> 
+> J = Joiner secondary issue of a company, identified by Compustat in monthly 
+> security data.
+>
+> C = Primary, assigned by CRSP to resolve ranges of overlapping or missing 
+> primary markers from Compustat in order to produce one primary security
+> throughout the company history.
+
+Ideas
+
+ - do as in [merge_funda_crsp_bycusip.sas](https://wrds-www.wharton.upenn.edu/pages/support/research-wrds/sample-programs/program-merge-crsp-and-compustat-using-cusip/) but with compm.fundq
+ - figure out whether this guide is legit and use it 
+   http://www.ruidaiwrds.info/data/linking-crsp-and-compustat
+
+See also [crspmerge.sas](https://wrds-web.wharton.upenn.edu/wrds/support/code_show.cfm?path=CRSP/crspmerge.sas)
+on how to merge `crsp.msf` and `crsp.msenames`. 
+
+<div class="hideable">
+
+```{r get_monthly_data}
+overwrite <- FALSE
+wrds <- .wrdsconnect()
+for(yr in 1962:2017){
+  sql. <- paste(readLines("sql/merged_monthly.sql"), collapse = "\n")
+  f_name <- file.path("data", "CRSP", "monthly_stock", paste0(yr, ".RDS"))
+  
+  if(file.exists(f_name) && !overwrite){
+    old_sql <- readRDS(f_name)$sql
+    if(isTRUE(all.equal(old_sql, sql.))){
+      cat(sQuote(f_name), "exists and will not be overwritten...\n")
+      next
+    } else
+      cat("Old", sQuote("cmds"), "object does not match new. Running new\n")
+  }
+  
+  params <- list(paste0(yr, "-12-31"), paste0(yr, "-01-01"))
+  cat("Getting data...\n")
+  sql. <- paste(readLines("sql/merged_monthly.sql"), collapse = "\n")
+  cat("\nRunning\n\n\t", gsub("\n", "\n\t", sql.), 
+      "\n\nwith parameters: ", 
+      sQuote(paste(deparse(params), sep = "\n")), sep = "")
+  
+  res <- dbSendQuery(wrds, sql.)
+  res <- dbBind(res, params)
+  dat <- dbFetch(res, n = -1)
+  dbClearResult(res)
+  
+  # checks 
+  stopifnot(max(xtabs(~ cusip, dat)) == 12L, any(xtabs(~ cusip, dat) == 12L))
+  stopifnot(max(xtabs(~ gvkey, dat)) == 12L, any(xtabs(~ gvkey, dat) == 12L))
+  
+  # save
+  cat("Final number of rows are ", nrow(dat), ". Saving data...\n", sep = "")
+  saveRDS(list(data = dat, sql = sql.), f_name)
+}
+```
+
+</div>
+
+### Stack monthly data
+
+```{r stack_month}
+# where we want data after
+yr_lb <- 1978L
+
+#####
+# load data
+file_stack <- "data/CRSP/monthly_stacked.RDS"
+
+fs <- list.files("data/CRSP/monthly_stock/", full.names = TRUE)
+fs <- fs[grepl("RDS$", fs)]
+length(fs) # number of files
+
+# only take data after a given year
+yr <- as.integer(gsub("(.+/)(\\d{4})([^/]+)$", "\\2", fs))
+fs <- fs[yr > yr_lb]
+length(fs) # number of files
+
+# find last edit and check if we need to update 
+max_ti <- local({
+  ti <- lapply(lapply(fs, file.info), "[[", "mtime")
+  ti[[which.max(unlist(ti))]]
+})
+
+do_stack <- 
+  !file.exists(file_stack) || file.info(file_stack)$mtime <= max_ti
+
+if(do_stack){
+  cat("Stacking data\n")
+  
+  # stack data and save
+  stack_dat <- do.call(rbind, lapply(fs, function(x) readRDS(x)$data))
+  saveRDS(stack_dat, file_stack)
+  
+} else 
+  cat("Not stacking data and using previous file\n")
+```
+
+```{r cleanup_month_crsp, echo = FALSE}
+rm(list = ls())
+wrds <- .wrdsconnect()
+```
+
+### Multiple permnos in the same month 
+
+As mentioned on the 
+[Fama-French Factors site on WRDS](https://wrds-www.wharton.upenn.edu/pages/support/applications/risk-factors-and-industry-benchmarks/fama-french-factors/), 
+some permcos will match with multiple permnos. We can
+
+1. handle this in the same way as in the above link. I.e. add the market value up on permco
+   level and then add the computed market value  to the permno with the highest market value.
+2. disregard this assuming there are few firms with multiple permnos. 
+
+We make the following query to check the latter
+
+<div class="hideable">
+
+```{r how_may_mult_permnos, cache = 1}
+#####
+# find number of permco with x number of permnos for each month
+sql. <- "
+select b.ym, b.n_permno, count(distinct b.permco) as n_firms
+from (
+  select a.ym, a.permco, count(distinct a.permno) as n_permno
+  from (
+    select date_trunc('month', date) as ym, permco, permno
+    from crsp.msf) as a 
+  group by a.ym, a.permco) as b
+group by b.ym, b.n_permno"
+
+que <- dbSendQuery(wrds, sql.)
+n_permnos <- dbFetch(que, n = -1)
+dbClearResult(que)
+
+n_permnos$n_permno <- as.integer(n_permnos$n_permno)
+n_permnos$n_firms <- as.integer(n_permnos$n_firms)
+
+library(data.table)
+n_permnos <- data.table(n_permnos)
+
+# some have quite a few
+max(n_permnos$n_permno)
+
+#####
+# plot
+setkey(n_permnos, ym, n_permno)
+tmp <- n_permnos[, .(
+  `1`      =     n_firms[n_permno == 1L]     / sum(n_firms), 
+  `2`      =     n_firms[n_permno == 2L ]    / sum(n_firms), 
+  `[3, 5]` = sum(n_firms[n_permno %in% 3:5]) / sum(n_firms), 
+  `>5`     = sum(n_firms[n_permno > 5]     ) / sum(n_firms)), 
+  by = ym]
+
+par(mar = c(5, 4, .5, .5))
+matplot(tmp$ym, tmp[, -1L, with = FALSE], type = "l", lty = 1, 
+        ylab = "Fraction of permco by # permno", xlab = "Time")
+abline(h = 1, lty = 2)
+legend("topleft", legend = colnames(tmp)[-1], lty = 1, col = 1:4, bty = "n")
+
+matplot(tmp$ym, tmp[, -(1:2), with = FALSE], type = "l", lty = 1, 
+        ylab = "Fraction of permco by # permno", xlab = "Time")
+abline(h = 0, lty = 2)
+legend("topleft", legend = colnames(tmp)[-(1:2)], lty = 1, col = 1:3, bty = "n")
+```
+
+</div>
+
+We will later do as in 1. above.
+
+### Delisting data
+
+Download delisting dates, their codes, and add the first month in which we see 
+a return
+
+<div class="hideable">
+
+```{r delist_data}
+f <- file.path("data", "CRSP", "delist.RDS")
+
+sql. <- "
+   select a.permno, a.permco, a.dlstdt, a.dlstcd, a.nwperm, a.nwcomp, b.first_ret
+   from crsp.msedelist as a
+   left join (
+    select min(date) as first_ret, permno
+    from crsp.msf
+    group by permno
+   ) as b on a.permno = b.permno
+   /* code 1xx is active status */
+   where a.dlstdt > '1979-01-01' and a.dlstcd > 199" 
+
+if(!file.exists(f) || !isTRUE((dat <- readRDS(f))$sql == sql.)){
+  cat(sQuote(f), "not found\n")
+  
+  res <- dbSendQuery(wrds, sql.)
+  dat <- dbFetch(res, n = -1)
+  dbClearResult(res)
+  
+  # sanity check
+  stopifnot(
+    # some only have one date and this is where they delist?
+    any(dat$dlstdt == dat$first_ret),
+    all(dat$dlstdt >= dat$first_ret), 
+    !anyDuplicated(dat$permno),
+    anyDuplicated(dat$permco) > 0)
+  
+  dat <- list(data = dat, sql = sql.)
+  saveRDS(dat, f)
+  
+} else
+  cat(sQuote(f), "found\n")
+
+table(dat$data$dlstcd)
+length(unique(dat$data$permno))
+length(unique(dat$data$permco))
+```
+
+</div> 
+
+`DLSTDT` is the delisting day and `DLSTCD` is the delisting code. It can these 
+first digit values
+
+| Code | Category                      |
+|------|-------------------------------|
+| 100  | Active                        |
+| 200  | Mergers                       |
+| 300  | Exchanges                     |
+| 400  | Liquidations                  |
+| 500  | Dropped                       |
+| 600  | Expirations                   |
+| 900  | Domestics that became Foreign |
+
+Further
+
+> The second and third digits of the delisting codes provide further detail of 
+delisting events.
+
+It seems important to note that
+
+> Delisting Date
+> 
+> Delisting Date is an integer containing the date in YYYYMMDD format of a 
+security's last price on the current exchange. If the security is still active, 
+Delisting Date is set to the last date of available price data. Delisting date 
+is never missing.
+
+## Daily data
+
+The code below gets data from
+
+- [`crsp.dsf`](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=137&file_id=67061).
+- [`crsp.dse`](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=137&file_id=67053).
+- [`crsp.dsenames`](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=137&file_id=67058).
+
+<div class="hideable">
+
+```{r dl_crsp}
+overwrite <- FALSE
+vals <- expand.grid(year = 1978:2017, quater = 1:4)
+
+for(i in 1:nrow(vals)){
+  #####
+  # setup SQL queries
+  y <- vals[i, "year"]
+  q <- vals[i, "quater"]
+  
+  cat("Getting data...\n")
+  sql. <- paste(readLines("sql\\daily_crsp.sql"), collapse = "\n")
+  
+  start_date <- paste0(y, "-", sprintf("%02d", 1L + (q - 1L) * 3L), "-01")
+  sql. <- gsub("\\{STAT_DATE\\}", start_date, sql.)
+  
+  end_date <- paste0(
+    y, "-", sprintf("%02d", q * 3L), 
+    "-", switch (q, "1" = 31L, "2" = 30L, "3" = 30L, "4" = 31L))
+  sql. <- gsub("\\{END_DATE\\}", end_date, sql.)
+  
+  sql. <- gsub("\\{S\\}", "d", sql.)
+  cmds <- strsplit(sql., ";")[[1]]
+  
+  f_name <- file.path("data", "CRSP", "daily_stock", paste0(y, "_Q", q, ".RDS"))
+  if(file.exists(f_name) && !overwrite){
+    old_cmds <- readRDS(f_name)$cmds
+    if(isTRUE(all.equal(old_cmds, cmds))){
+      cat(sQuote(f_name), "exists and will not be overwritten...\n")
+      next
+    } else
+      cat("Old", sQuote("cmds"), "object does not match new. Running new\n")
+    
+  }
+  
+  out <- lapply(cmds, function(cmd){
+      require(RPostgres)
+      cmd <- paste0(cmd, ";")
+      # cat("Running the following sql script\n")
+      # cat(cmd, "\n")
+      
+      res <- dbSendQuery(wrds, cmd)
+      out <- dbFetch(res, n = -1)
+      cat("The object requires", object.size(out) / 10^6, " mb\n")
+      
+      # clean-up
+      dbClearResult(res)
+      dbDisconnect(wrds)
+      .GlobalEnv$wrds <- .wrdsconnect()
+      
+      out
+    })
+  
+  cat("Number of rows for the result is\n")
+  print(lapply(out, nrow))
+  
+  cat("Merging...\n")
+  stock_dat <- out[[1]]
+  event_dat <- out[[2]]
+  rm(out)
+  
+  stock_dat$is_stock <- TRUE
+  event_dat$is_event <- TRUE
+  
+  out <- merge(stock_dat, event_dat, by = c("permno", "date"), all = TRUE)
+  rm(stock_dat, event_dat)
+  
+  cat("Carry last value forward...\n")
+  stopifnot(!is.unsorted(order(out$permno, out$date)))
+  require(zoo)
+  out$exchcd <- 
+    do.call(c, tapply(out$exchcd, out$permno, na.locf, na.rm = FALSE))
+  
+  cat("Removing non-stock data rows. There are", nrow(out), "rows before...\n")
+  out <- out[!is.na(out$is_stock), ]
+  out[c("is_stock", "is_event")] <- NULL
+  
+  cat("There are", nrow(out), "rows after\n")
+  
+  cat("Droppings rows which we now are not listed on the relevant exchanges...\n")
+  print(xtabs(~out$exchcd, addNA = TRUE))
+  
+  out$keep <- is.na(out$exchcd) | out$exchcd %in% c(-(2:1), 1:3)
+  out <- out[out$keep, ]
+  out$keep <- NULL
+  
+  cat("Final number of rows are ", nrow(out), ". Saving data...\n", sep = "")
+  saveRDS(list(data = out, cmds = cmds), f_name)
+}
+```
+
+</div>
+
+```{r look_at_db_crsp, echo = FALSE, eval = FALSE}
+res <- dbSendQuery(wrds, "SELECT DISTINCT HEXCD FROM CRSP.DSF;")
+dbFetch(res, n = -1)
+#   HEXCD
+# 1     1
+# 2     2
+# 3     3
+# 4     4
+dbClearResult(res)
+
+res <- dbSendQuery(wrds, "SELECT DISTINCT EXCHCD FROM CRSP.DSE;")
+sort(dbFetch(res, n = -1)[[1]])
+# [1] -2 -1  0  1  2  3  4 10 13 16 17 19 20 31 32 33
+dbClearResult(res)
+
+# all data sets
+res <- dbSendQuery(wrds, "select distinct table_name
+                   from information_schema.columns
+                   where table_schema='comp'
+                   order by table_name")
+dbFetch(res, n=-1)
+dbClearResult(res)
+
+# columns in data set
+res <- dbSendQuery(wrds, "select column_name
+                   from information_schema.columns
+                   where table_schema='comp'
+                   and table_name='funda'
+                   order by column_name")
+dbFetch(res, n=-1)
+dbClearResult(res)
+```
+
+### Stack daily data
+
+Create list of `PERMNO`s to include from the merged COMPUSTAT and CRSP data
+
+```{r unique_permno}
+uni_perm <- unique(readRDS("data/CRSP/monthly_stacked.RDS")$permno)
+```
+
+First we merge the data. We start by stacking the daily data
+
+```{r merge_dat_daily}
+# where we want data after
+yr_lb <- 1978L
+
+#####
+# load data
+file_stack <- "data/CRSP/daily_stacked.RDS"
+
+fs <- list.files("data/CRSP/daily_stock/", full.names = TRUE)
+fs <- fs[grepl("RDS$", fs)]
+length(fs) # number of files
+
+# only take data after a given year
+yr <- as.integer(gsub("(.+/)(\\d{4})([^/]+)$", "\\2", fs))
+fs <- fs[yr > yr_lb]
+length(fs) # number of files
+
+# find last edit and check if we need to update 
+max_ti <- local({
+  ti <- lapply(lapply(fs, file.info), "[[", "mtime")
+  ti[[which.max(unlist(ti))]]
+})
+
+do_stack <- 
+  !file.exists(file_stack) || file.info(file_stack)$mtime <= max_ti
+
+if(do_stack){
+  cat("Stacking data\n")
+  
+  library(data.table)
+  # stack data and save
+  stack_dat <- do.call(rbind, lapply(fs, function(x){
+    new_dat <- readRDS(x)$data
+    
+    # compute market value and add sum of market value to the permno within a 
+    # (permco, date) pair with the highest mv
+    new_dat <- data.table(new_dat)
+    setkey(new_dat, permco, date)
+    new_dat[, mv := abs(prc) * shrout][
+      , `:=`(mv_use = mv, has_more = .N > 1L & sum(!is.na(mv)) > 1L), 
+      by = .(permco, date)][
+        has_more == TRUE, mv_use := 
+          ifelse(1:.N == which.max(mv), sum(mv, na.rm = TRUE), mv), 
+        by = .(permco, date)]
+      
+    cat(with(new_dat, mean(!is.na(mv) & mv != mv_use)), " has a new market", 
+        "value\n")
+    
+    stopifnot(all(new_dat[, is.na(mv) == is.na(mv_use) & 
+                            (is.na(mv) | mv <= mv_use)]))
+    new_dat[, mv := mv_use]
+    new_dat <- as.data.frame(new_dat)
+    
+    # only keep the rows we need
+    new_dat <- subset(new_dat, permno %in% uni_perm)
+    
+    # only keep the columns we need and adjust some types
+    new_dat$permno <- as.integer(new_dat$permno + sign(new_dat$permno) * 1e-8)
+    new_dat[, c("permno", "date", "mv", "ret")]
+    
+  }))
+  saveRDS(stack_dat, file_stack)
+  
+} else 
+  cat("Not stacking data and using previous file\n")
+```
+
+
+## Treasury Bill
+
+```{r cleanup_bill, echo = FALSE}
+rm(list = ls())
+wrds <- .wrdsconnect()
+```
+
+We need the 1-year Treasury Bill to compute the distance-to-default as in e.g., 
+@Vassalou04. We can get this from St. Louis Federal Reserve Bank's. See 
+[this site](https://fred.stlouisfed.org/series/GS1). We can also get 
+this from [frb.rates_daily](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=34&file_id=53609).
+
+<div class="hideable">
+
+```{r get_tres, cache = TRUE, message = FALSE}
+#####
+# dara from St. Louis Federal Reserve Bank's
+library(quantmod)
+library(RPostgres)
+getSymbols('DGS1', src = 'FRED')
+DGS1 <- data.frame(date = index(DGS1), r1y = drop(coredata(DGS1)) / 100)
+getSymbols('DGS3MO', src = 'FRED')
+DGS3MO <- data.frame(date = index(DGS3MO), r3m = drop(coredata(DGS3MO)) / 100)
+fred_dat <- merge(DGS1, DGS3MO, all = TRUE)
+
+#####
+# data from WRDS 
+sql. <- "
+select date, 
+  TCMNOM_M3 / 100 as m3 /* Treasury Constant Maturity 3-month */, 
+  TCMNOM_Y1 / 100 as y1 /* Treasury Constant Maturity 1-year */ 
+  from frb.RATES_DAILY"
+
+res <- dbSendQuery(wrds, sql.)
+dat <- dbFetch(res, n = -1)
+dbClearResult(res)
+
+#####
+# compare the two
+tmp <- merge(fred_dat, dat, by = "date", all = TRUE)
+matplot(tmp$date, tmp[, c("r1y", "y1")], pch = 16)
+matplot(tmp$date, tmp[, c("r3m", "m3")], pch = 16)
+
+# save the series
+saveRDS(fred_dat, file.path("data", "tress_bill.RDS"))
+```
+
+</div>
+
+## Stock indices
+
+Get S&P500 index from [crspa.dsp500](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=137&file_id=67002)
+
+<div class="hideable">
+
+```{r SP500}
+sql. <- "
+select caldt, 
+  ewretd, /* Equal-Weighted Return (includes distributions) */ 
+  ewretx, /* Equal-Weighted Return (excluding dividends) */ 
+  vwretd, /* Value-Weighted Return (includes distributions) */ 
+  vwretx, /* Value-Weighted Return (excluding dividends) */ 
+  totval /* Total Market Value */ 
+  from crspa.dsp500"
+
+res <- dbSendQuery(wrds, sql.)
+sp_dat <- dbFetch(res, n = -1)
+dbClearResult(res)
+
+sp_dat <- subset(sp_dat, caldt >= as.Date("1960-01-01"))
+plot(sp_dat$vwretd ~ sp_dat$caldt, type = "h") # value weighted
+plot(sp_dat$ewretd ~ sp_dat$caldt, type = "h") # equal weighted
+
+saveRDS(sp_dat, file.path("data", "SP500.RDS"))
+```
+
+</div>
+
+Get AMEX and NYSE indices. I think we can use the data from [crspa.dsic](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=137&file_id=66997) (the title is *(Daily) NYSE/AMEX Capitalization Deciles, Annual Rebalanced*). 
+I think it is the *CRSP Market Indexes* mentioned [here](http://www.crsp.com/products/documentation/stock-file-indexes-0). 
+
+<div class="hideable">
+
+```{r marked_indices}
+sql. <- "
+select caldt, 
+  vwretd, /* Value-Weighted Return-incl. dividends */ 
+  vwindd, /* Index Level Associated with VWRETD */ 
+  vwretx, /* Value-Weighted Return-excl. dividends */ 
+  vwindx, /* Index Level Associated with VWRETX */ 
+  ewretd, /* Equal-Weighted Return-incl. dividends */
+  ewindd, /* Index Level Associated with EWRETD */
+  ewretx, /* Equal-Weighted Return-excl. dividends */
+  ewindx, /* Index Level Associated with EWRETX */
+  sprtrn, /* Return on the S&P 500 Index */  
+  spindx, /* Level of the S&P 500 Index */
+  totval, /* Total Market Value */ 
+  totcnt  /* Total Market Count */
+  from crspa.dsic"
+
+res <- dbSendQuery(wrds, sql.)
+idx_dat <- dbFetch(res, n = -1)
+dbClearResult(res)
+
+head(idx_dat)
+plot(idx_dat$vwretd ~ idx_dat$caldt, type = "h")
+plot(idx_dat$sprtrn ~ idx_dat$caldt, type = "h")
+plot( sp_dat$vwretd ~ sp_dat$caldt , type = "h", xlim = range(idx_dat$caldt))
+
+saveRDS(idx_dat, file.path("data", "index.RDS"))
+```
+
+</div>
+
+We can also make the index our-self 
+
+<div class="hideable">
+
+```{r own_idx}
+f_name <- file.path("data", "index_self.RDS")
+.sql <- paste(readLines("sql/index.sql"), collapse = "\n")
+
+do_rerun <- !file.exists(f_name) || readRDS(f_name)$sql != .sql
+if(do_rerun){
+  cat("Getting data\n")
+  res <- dbSendQuery(wrds, .sql)
+  idx_self_dat <- dbFetch(res, n = -1)
+  dbClearResult(res)
+  
+  # save result
+  saveRDS(list(data = idx_self_dat, sql = .sql), f_name)
+  
+} else{
+  cat("Loading data\n")
+  idx_self_dat <- readRDS(f_name)$data
+  
+}
+
+#####
+# check data
+nrow(idx_dat)
+nrow(idx_self_dat)
+tmp <- merge(idx_dat, idx_self_dat, by.x = "caldt", by.y = "date", 
+             suffixes = c("_sic", "_self"))
+
+# results should be the same pre NASDAQ
+with(subset(tmp, caldt <= as.Date("1970-01-01")), 
+     cor(vwretd    , vwret))
+with(subset(tmp, caldt <= as.Date("1970-01-01")), 
+     cor(ewretx_sic, ewretx_self))
+with(subset(tmp, caldt <= as.Date("1970-01-01")), 
+     cor(totval    , market_size))
+with(subset(tmp, caldt <= as.Date("1970-01-01")), 
+     cor(totcnt    , n_firms))
+
+with(subset(tmp, caldt <= as.Date("1970-01-01")),
+     plot(caldt, (totval -  market_size) / totval, 
+          type = "l", main = "pre"))
+abline(h = 0, lty = 2)
+
+# may differ due to NASDAQ post NASDAQ starts
+with(tmp, cor(vwretd    , vwret))
+with(tmp, cor(ewretx_sic, ewretx_self))
+with(tmp, cor(totval    , market_size))
+with(tmp, cor(totcnt    , n_firms))
+
+with(tmp, plot(caldt, (totval -  market_size) / market_size, 
+               type = "l", main = "post"))
+abline(h = 0, lty = 2)
+with(tmp, plot(caldt, n_firms, type = "l", main = "post"))
+with(tmp, plot(caldt, vwretd - vwret, type = "h", main = "post"))
+abline(h = 0, lty = 2)
+with(tmp, plot(caldt, market_size, type = "l", main = "market size", 
+               log = "y"))
+```
+
+</div>
+
+## Compustat
+
+We start by looking at what variables people have used before in order to gather
+what we need to download. @Shumway01 uses (some of those below are parts of 
+ratios; the codes in table 1 refer to the data item number is the [annual data](http://www.crsp.com/products/documentation/annual-data-industrial))
+
+- `WCAPQ`: Working Capital (Balance Sheet)
+- `ATQ`: Assets - Total
+- `REQ`: Retained Earnings
+- `OIADPQ`: Operating Income After Depreciation (EBIT)
+- `SALEQ`: Sales/Turnover (Net)
+- `NIQ`: Net Income (Loss)
+- `LTQ`: Liabilities - Total
+- `LCTQ`: Current Liabilities - Total
+- `ACTQ`: Current Assets - Total
+- The logarithm of each firm’s size relative to the total size of the NYSE and 
+  AMEX market is used
+- Firm’s past excess return in year $t$ as the return of the firm in year 
+  $t - 1$ minus the value-weighted CRSP NYSE/AMEX index return in year $t - 1$
+- The idiosyncratic standard deviation of each firm’s stock returns
+   
+@Chava04 use 
+
+- Net income to total assets 
+- Total liabilities to total assets
+- Relative size defined as the logarithm of each firm’s equity value 
+  divided by the total NYSE/AMEX market equity value
+- A dummy for ten industries by the 4-digit SIC code with some interactions. 
+  The four digit SIC codes for each company is from CRSP and it is 
+  time-varying. 
+- Excess return defined as the monthly return of the firm minus the 
+  value-weighted CRSP NYSE/AMEX index return cumulated to
+  obtain the yearly return
+- The stock’s volatility. The stock’s volatility for the present year is 
+  computed as the sample standard deviation using the last sixty observable 
+  daily market prices
+  
+The latter is not what @Shumway01 does.
+
+@Duffie07 use (see [this site](http://www.crsp.com/products/documentation/quarterly-data-industrial) for the legacy codes they refer to)
+
+- `DLCQ`: Debt in Current Liabilities (data45)
+- `LCTQ`: Current Liabilities - Total (data49)
+- `DLTTQ`: Long-Term Debt - Total (data51)
+- `CSHOQ`: Common Shares Outstanding (data61)
+- Distance-to-default
+
+@Campbell08 use (I think I have the right variables)
+
+- Net Income to Market-valued Total Assets
+- Net Income to Total Assets
+- Total liabilities relative to total assets
+- Total liabilities divided by the sum of market equity and book liabilities
+- Cash and short-term assets, `CHEQ`, to the market value
+- Market-to-book ratio (Book Value = Total Assets – Total Liabilities). 
+  Seems like we can compute with `sum(SEQQ, coalesce(TXDITC,sum(TXDB, ITCB)),-pstk_new)`
+  were `SEQQ` = Shareholders' Equity - Total, 
+  `TXDITCQ` = Deferred Taxes and Investment Tax Credit, `TXDB` and `ITCB` are 
+  only the yearly data, and 
+  `pstk_new=coalesce(PSTKRV,PSTKL,PSTK); /*preferred stock*/`
+- Log excess return on each firm’s equity relative to the S&P 500 index
+- Relative size of each firm measured as the log ratio of its market 
+  capitalization to that of the S&P 500 index
+- Firm’s log price per share, truncated above at $15
+
+@Bharath08 use
+
+- Various forms of distance-to-default
+- `DLCQ`: Debt in Current Liabilities (data45)
+- `DLTTQ`: Long-Term Debt - Total (data51)
+- Net income to total assets
+- Each firm's past excess return in year $t$ as the return of the firm in year 
+  $t - 1$ minus the value- weighted CRSP NYSE/AMEX index return in return in 
+  year $t - 1$
+- Each firm's annual returns are calculated by cumulating monthly returns. 
+
+@Lando10 use 
+
+- 1-year equity return
+- 1-year distance-to-default
+- Quick ratio, calculated as the sum of cash, short-term investments and total 
+  receivables divided by current liabilities
+- Percentage short term debt, calculated as debt in current liabilities 
+  divided by the sum of debt in current liabilities and long-term debt
+- Book asset value (log)
+
+@Chava11 use
+
+- Four digit `DNUM` industry codes from COMPUSTAT
+- A industry dummy which is one if the median stock return in that industry during
+the year is less than -20%
+- The relative size, defined as the logarithm of each firm's equity value 
+divided by the total NYSE/AMEX/NASDAQ market capitalization
+- The excess return, defined as the return of the firm minus the 
+value-weighted CRSP NYSE/AMEX/NASDAQ index return
+- The ratio of net income to total assets
+- The ratio  of total liabilities to  total assets
+- The volatility, defined as the idiosyncratic standard deviation of the 
+firm's monthly stock returns
+- The firm's trailing one year stock return, computed by cumulating the firm's
+  monthly return
+- The distance-to-default constructed as in @Bharath08
+- The logarithm of the total assets
+- The market-to-book ratio
+- The ratio of property plant and equipment to total assets
+
+@Duan12 use
+
+- Distance-to-default
+- Sum of cash and short-term investments to the total assets
+- Net income to the total assets.
+- Logarithm of the ratio of a firm’s market equity value to the average market 
+  equity value of the S&P500 firms
+- Market-to-book asset ratio
+- 1-year idiosyncratic volatility as in @Shumway01
+
+@Lando13 use (I think I have the right variables)
+
+- Quick ratio: book value of cash and short-term investments, `CHEQ`, added the book 
+  value of total receivables, `RECTQ`, divided by  the book value of total current 
+  liabilities, `LCTQ`
+- Pledgeable assets: book value of total current assets, `LCTQ`, plus the book value of 
+  net property, plant, and equipment 
+- Trailing 1-year equity return
+- Trailing 1-year distance-to-default
+- Percentage short-term debt:  the book value of debt in current liabilities 
+  divided by the sum of the book value of debt in current liabilities and the 
+  book value of total long-term debt
+  
+Maybe check [WRDS Financial Ratios Suite](https://wrds-www.wharton.upenn.edu/pages/support/research-wrds/sample-programs/wrds-financial-ratios-suite/).
+We get the data from [`compm.fundq`](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=130&file_id=66036). The quarterly does not have a SIC code
+
+```{r issue_w_sic}
+#####
+# quaterly data
+res <- dbSendQuery(wrds, "select column_name
+                   from information_schema.columns
+                   where table_schema='comp'
+                   and table_name='fundq'
+                   order by column_name")
+out <- dbFetch(res, n=-1)$column_name
+out[grepl("^si", out)]
+dbClearResult(res)
+
+#####
+# yearly data
+res <- dbSendQuery(wrds, "select column_name
+                   from information_schema.columns
+                   where table_schema='comp'
+                   and table_name='funda'
+                   order by column_name")
+out <- dbFetch(res, n=-1)$column_name
+out[grepl("^si", out)]
+dbClearResult(res)
+```
+
+So we need the [`compm.funda`](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=130&file_id=66034)
+which we anyway do to also get the annual figures.
+
+```{r get_compustat}
+file_comp <- "data/compustat.RDS"
+
+#####
+# we form the sql and check if we need update the data
+sql. <- paste(readLines("sql/compustat.sql"), collapse = "\n")
+
+# get parameters for query
+gvkeys_keep <- unique(readRDS("data/CRSP/monthly_stacked.RDS")$gvkey)
+
+res <- dbSendQuery(wrds, "select distinct gvkey from compm.fundq")
+gvkeys_db <- dbFetch(res, n = -1)$gvkey
+dbClearResult(res)  
+excl_gvkey <- setdiff(gvkeys_db, gvkeys_keep)
+
+sql. <- gsub(
+  "\\{GVKEY_EXL\\}", paste0("(", paste0("'", excl_gvkey, "'", collapse = ", "), 
+                            ")"), 
+  sql.)
+sql. <- gsub("\\{MIN_DATE\\}", "1978-01-01", sql.)
+
+# check if we need to update and if we do then do it
+do_update <- !file.exists(file_comp) || readRDS(file_comp)$sql != sql.
+
+if(do_update){
+  cat("Updating file\n")
+  
+  # send query, get data, and save
+  res <- dbSendQuery(wrds, sql.)
+  dat <- dbFetch(res, n = -1)
+  dbClearResult(res)
+  
+  saveRDS(list(data = dat, sql = sql.), file_comp)
+} else
+  cat("Not updating file\n")
+```
+
+
+## References

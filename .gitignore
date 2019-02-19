@@ -1,0 +1,11 @@
+packrat/lib*/
+.Rproj.user
+packrat/src/
+.Rhistory
+.RData
+markdown/fig
+markdown/cache
+*.old.*
+
+temp/*
+!temp/.Placeholder
