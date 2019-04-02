@@ -208,6 +208,7 @@ local({
     tmp, compu[, .(conm = conm[1]), by = gvkey], by = "gvkey")
   
   # sample random rows
+  set.seed(69630302)
   tmp <- tmp[sample.int(nrow(tmp), 100), ]
   print(t(as.matrix(tmp[, .(issuer_nam, conm)])))
 })
@@ -757,6 +758,7 @@ get_nasdaq_sym(return_regexp = TRUE)
 
 # Find matches and print examples
 could_be_NASDAQ <- !is.na(get_nasdaq_sym(compu_tic$tic))
+set.seed(69630302)
 sample(compu_tic$tic[ could_be_NASDAQ], 50) # These match
 sample(compu_tic$tic[!could_be_NASDAQ], 50) # These do not
 sum(could_be_NASDAQ) # Number of potential matches
@@ -783,6 +785,7 @@ get_other_sym(n_letters = 1, return_regexp = TRUE)
 get_other_sym(n_letters = 3, return_regexp = TRUE)
 
 # Find matches and print examples
+set.seed(69630302)
 could_be_N_n_A <- 
   !is.na(get_other_sym(compu_tic$tic, n_letters = 1L)) | 
   !is.na(get_other_sym(compu_tic$tic, n_letters = 2L)) | 
@@ -1325,6 +1328,7 @@ local({
   
   cat("Some random names with duplicate", sQuote("mast_issr_num"), "\n")  
   tmp <- tmp[count > 1L][, .(count = first(count)), by = issuer_nam]
+  set.seed(69630302)
   print(tmp[sample.int(nrow(tmp), min(10, nrow(tmp)))])
 })
 
@@ -1346,6 +1350,7 @@ local({
   
   cat("Some random names with duplicate", sQuote("gvkey"), "\n")  
   tmp <- tmp[count > 1L][, .(count = first(count)), by = conm]
+  set.seed(69630302)
   print(tmp[sample.int(nrow(tmp), min(10, nrow(tmp)))])
 })
 ```
