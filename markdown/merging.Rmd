@@ -60,7 +60,8 @@ fs <- list(
   tress        = file.path("data", "tress_bill.RDS"), 
   idx          = file.path("data", "index.RDS"), 
   ym_R         = file.path("R", "ym.R"), 
-  delist       = file.path("data", "CRSP", "delist.RDS"))
+  delist       = file.path("data", "CRSP", "delist.RDS"),
+  inflation    = file.path("data", "inflation.RDS"))
 ```
 
 ```{r check_rebuild, echo = FALSE, cache = TRUE, cache.extra = tools::md5sum(unlist(fs))}
@@ -94,6 +95,7 @@ moody_issuer <- readRDS(fs$moody_issuer)
 mth          <- readRDS(fs$monthly)
 idx_dat      <- readRDS(fs$idx)
 tress        <- readRDS(fs$tress)
+inflation    <- readRDS(fs$inflation)
 ```
 
 We add the delisting information to `market` table
@@ -345,6 +347,17 @@ macro_dat <- merge(macro_dat, tress, by = "ym", all.x = TRUE)
 # we dont have any NAs
 macro_dat <- subset(macro_dat, date > as.Date("1970-01-01"))
 stopifnot(!anyNA(macro_dat$log_market_ret), !anyNA(macro_dat$r1y))
+```
+
+Inflation index
+
+```{r add_inflation}
+inflation$ym <- make_ym(inflation$caldt)
+
+# merge
+macro_dat <- merge(
+  macro_dat, inflation[, c("ym", "cpiind")], by = "ym", all.x = TRUE)
+stopifnot(!anyNA(macro_dat$cpiind))
 ```
 
 ## Check number of firms in other data sets
@@ -1169,6 +1182,59 @@ final[, r_mv_ltq := ifelse(ltq <= 0, NA_real_, mv / (ltq * 1000))]
 # check stats
 sapply(final[, .(r_mv_atq, r_actq_lctq, r_mv_ltq)], sum_func)
 ```
+
+Compute other deflated size measures
+
+<div class="hideable">
+
+```{r dfl_size}
+final[
+  , `:=`(
+    # deflated total assets
+    atq_defl  = atq  / cpiind * 100, 
+    # deflated pledgeable assets as in David et al. (2013). It is current assets
+    # plus Property, Plant and Equipment in the aforementioned paper. We only 
+    # include current assets
+    actq_defl = actq / cpiind * 100)]
+
+# plot mean vs. time to check that level is somewhat stable
+local({
+  func <- function(trans, stats, xlab_suf){
+    par(mar = c(5, 4, 1, 1), mfcol = c(1, 2))
+    f <- function(s){
+      z <- tapply(trans(final[[s]]), final$tstop, stats, na.rm = TRUE)
+      z <- z / z[1] # scale to index 1 at start
+      
+      plot(z, type = "l", ylab = paste(s, xlab_suf))
+    }
+    for(s in c("atq_defl", "actq_defl")){
+      f(s)
+      f(gsub("_defl", "", s))
+      
+    }
+  }
+  
+  func(identity, mean, "(mean)")
+  func(identity, median, "(median)")
+  func(function(x) suppressWarnings(log(x)), mean, "(log)")
+})
+
+# check correlations
+cor(final[, .(rel_size, log(atq_defl), log(actq_defl + 1))], 
+    use = "complete.obs")
+# after winsorizing
+local({
+  tmp <- final[, .(rel_size, log(atq_defl), log(actq_defl + 1))]
+  tmp <- tmp[complete.cases(tmp), ]
+  cor(tmp[
+    , lapply(.SD, function(x){
+      qs <- quantile(x, c(.01, .99))
+      pmin(pmax(x, qs[1]), qs[2])
+    })], use = "complete.obs")
+})
+```
+
+</div>
 
 Cap the stop times and the event variables 
 

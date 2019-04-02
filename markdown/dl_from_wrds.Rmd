@@ -593,6 +593,27 @@ saveRDS(fred_dat, file.path("data", "tress_bill.RDS"))
 
 </div>
 
+## Inflation index
+Download inflation index from the 
+[mcti](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=138&file_id=67186)
+database. See 
+[crsp.com/products/documentation/crsp-treasury-and-inflation-indexes-0](http://www.crsp.com/products/documentation/crsp-treasury-and-inflation-indexes-0). 
+
+```{r get_inflation}
+res <- dbSendQuery(
+  wrds, "select caldt, cpiind from crsp.mcti")
+dat <- dbFetch(res, n = -1)
+dbClearResult(res)
+
+# December 29, 1972 (19721229) equals 100
+dat$caldt <- as.Date.character(dat$caldt, "%Y%m%d")
+with(dat, plot(caldt, cpiind, type = "l"))
+abline(h = 100, lty = 2) 
+abline(v = as.Date("1972-12-29"), lty = 2)
+
+saveRDS(dat, file.path("data", "inflation.RDS"))
+```
+
 ## Stock indices
 
 Get S&P500 index from [crspa.dsp500](https://wrds-web.wharton.upenn.edu/wrds/tools/variable.cfm?library_id=137&file_id=67002)
